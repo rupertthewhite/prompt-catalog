@@ -467,6 +467,8 @@ function PromptCatalog() {
   const [sortField, setSortField] = useState("sortOrder");
   const [sortDir, setSortDir] = useState("desc");
   const [viewMode, setViewMode] = useState("list"); // "list" | "grid"
+  const [sidebarWidth, setSidebarWidth] = useState(280);
+  const resizing = useRef(false);
   const [theme, setTheme] = useState("dark");
   const [tagColors, setTagColors] = useState({});
   const [templates, setTemplates] = useState([]);
@@ -787,6 +789,31 @@ function PromptCatalog() {
   };
 
   // ── Drag reorder ──
+  // ── Sidebar resize ──
+  const onResizeStart = (e) => {
+    e.preventDefault();
+    resizing.current = true;
+    const startX = e.clientX || e.touches?.[0]?.clientX;
+    const startW = sidebarWidth;
+    const onMove = (ev) => {
+      const x = ev.clientX || ev.touches?.[0]?.clientX;
+      const newW = Math.max(200, Math.min(500, startW + x - startX));
+      setSidebarWidth(newW);
+    };
+    const onUp = () => {
+      resizing.current = false;
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.removeEventListener("touchmove", onMove);
+      document.removeEventListener("touchend", onUp);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+    document.addEventListener("touchmove", onMove);
+    document.addEventListener("touchend", onUp);
+  };
+
+  // ── Drag reorder ──
   const onDragOver = (e, id) => { e.preventDefault(); if (dragId && dragId !== id) { e.currentTarget.style.borderTop = "2px solid var(--accent)"; } };
   const onDragLeave = (e) => { e.currentTarget.style.borderTop = ""; };
   const onDrop = async (e, targetId) => {
@@ -947,7 +974,7 @@ function PromptCatalog() {
       {zoomImg && <ZoomModal src={zoomImg} onClose={() => setZoomImg(null)} />}
 
       {/* ── Sidebar ── */}
-      <div style={{ width: 280, minWidth: 280, borderRight: "1px solid var(--border)", display: "flex", flexDirection: "column", background: "var(--panel)" }}>
+      <div style={{ width: sidebarWidth, minWidth: 200, maxWidth: 500, borderRight: "1px solid var(--border)", display: "flex", flexDirection: "column", background: "var(--panel)" }}>
         <div style={{ padding: "12px 14px 8px", borderBottom: "1px solid var(--border)" }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
             <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text2)" }}>Prompt Catalog</span>
@@ -1161,6 +1188,11 @@ function PromptCatalog() {
             {showTrash && trashCount > 0 && <button onClick={() => { if (confirm("Empty trash? This is permanent.")) emptyTrash(); }} style={{ background: "none", border: "1px solid var(--border)", borderRadius: 3, color: "var(--danger)", padding: "2px 6px", fontSize: 10, cursor: "pointer" }}>Empty trash</button>}
           </div>
         </div>
+      </div>
+
+      {/* Resize handle */}
+      <div onMouseDown={onResizeStart} onTouchStart={onResizeStart} style={{ width: 5, cursor: "col-resize", background: "transparent", flexShrink: 0, position: "relative", zIndex: 10 }}>
+        <div style={{ position: "absolute", inset: "0 -2px", background: resizing.current ? "var(--accent)" : "transparent" }} />
       </div>
 
       {/* ── Main panel ── */}
