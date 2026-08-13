@@ -1,0 +1,1311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Prompt Catalog">
+<meta name="theme-color" content="#0f172a">
+<title>Prompt Catalog</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body, #root { height: 100%; overflow: hidden; }
+  body { font-family: system-ui, -apple-system, sans-serif; }
+</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-type="module">
+// ── IndexedDB Storage Layer ──
+const DB_NAME = 'prompt-catalog-db';
+const DB_VERSION = 1;
+const DB_STORE = 'data';
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (e) => { e.target.result.createObjectStore(DB_STORE); };
+    req.onsuccess = (e) => resolve(e.target.result);
+    req.onerror = (e) => reject(e.target.error);
+  });
+}
+
+async function idbGet(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, 'readonly');
+    const req = tx.objectStore(DB_STORE).get(key);
+    req.onsuccess = () => resolve(req.result !== undefined ? req.result : null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbSet(key, value) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, 'readwrite');
+    tx.objectStore(DB_STORE).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function idbDelete(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, 'readwrite');
+    tx.objectStore(DB_STORE).delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function idbListKeys(prefix) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, 'readonly');
+    const req = tx.objectStore(DB_STORE).getAllKeys();
+    req.onsuccess = () => resolve(req.result.filter(k => typeof k === 'string' && k.startsWith(prefix)));
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// React globals
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+
+const STORE = { entries: "pc-entries-v4", tagColors: "pc-tag-colors", templates: "pc-templates", theme: "pc-theme", folders: "pc-folders" };
+const TAG_PALETTE = ["#ef4444","#f97316","#eab308","#22c55e","#06b6d4","#3b82f6","#8b5cf6","#ec4899","#f43f5e","#14b8a6","#a855f7","#64748b"];
+const BLOCK_COLORS = { Subject: "#f97316", Clothing: "#eab308", Action: "#22c55e", Context: "#06b6d4", Style: "#8b5cf6", Camera: "#3b82f6", Composition: "#ec4899", Text: "#64748b", Anchor: "#14b8a6" };
+const MAX_PX = 1600;
+const THUMB_PX = 80;
+
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+function fmtDate(ts) { return new Date(ts).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }); }
+
+// ── Image compression ──
+function resizeImage(dataUrl, maxPx) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      let { width: w, height: h } = img;
+      if (w > maxPx || h > maxPx) {
+        const scale = maxPx / Math.max(w, h);
+        w = Math.round(w * scale);
+        h = Math.round(h * scale);
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = w; canvas.height = h;
+      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+      resolve(canvas.toDataURL("image/jpeg", 0.82));
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
+
+async function compressAndStore(dataUrl) {
+  const id = "pc-img:" + uid();
+  const compressed = await resizeImage(dataUrl, MAX_PX);
+  const thumb = await resizeImage(dataUrl, THUMB_PX);
+  await sSet(id, compressed);
+  return { imageId: id, thumb };
+}
+
+async function loadImage(imageId) {
+  if (!imageId) return null;
+  return await sGet(imageId);
+}
+
+async function deleteImage(imageId) {
+  if (!imageId) return;
+  try { await idbDelete(imageId); } catch {}
+}
+
+function wordDiff(a, b) {
+  const wa = a.split(/(\s+)/), wb = b.split(/(\s+)/);
+  const m = wa.length, n = wb.length;
+  const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+  for (let i = 1; i <= m; i++) for (let j = 1; j <= n; j++)
+    dp[i][j] = wa[i-1] === wb[j-1] ? dp[i-1][j-1] + 1 : Math.max(dp[i-1][j], dp[i][j-1]);
+  const result = [];
+  let i = m, j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && wa[i-1] === wb[j-1]) { result.unshift({ type: "same", text: wa[i-1] }); i--; j--; }
+    else if (j > 0 && (i === 0 || dp[i][j-1] >= dp[i-1][j])) { result.unshift({ type: "add", text: wb[j-1] }); j--; }
+    else { result.unshift({ type: "del", text: wa[i-1] }); i--; }
+  }
+  return result;
+}
+
+function newEntry(overrides = {}) {
+  return { id: uid(), title: "", prompt: "", tags: [], model: "", outputImages: [], refImageId: null, refThumb: null, refFilename: "", imageDate: "", notes: "", pinned: false, parentId: null, deleted: false, sortOrder: Date.now(), createdAt: Date.now(), modifiedAt: Date.now(), folder: "", highlights: [], ...overrides };
+}
+// outputImages entries: { imageId, thumb, filename }
+
+// Storage helpers
+async function sGet(key) { try { return await idbGet(key); } catch { return null; } }
+async function sSet(key, val) { try { await idbSet(key, val); } catch(e) { console.error(e); } }
+
+// ── Small components ──
+
+function TagInput({ tags, onChange, tagColors }) {
+  const [input, setInput] = useState("");
+  const add = () => { const t = input.trim().toLowerCase(); if (t && !tags.includes(t)) onChange([...tags, t]); setInput(""); };
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 5, alignItems: "center" }}>
+      {tags.map((tag) => (
+        <span key={tag} style={{ background: tagColors?.[tag] ? tagColors[tag] + "22" : "#334155", color: tagColors?.[tag] || "#94a3b8", padding: "2px 9px", borderRadius: 3, fontSize: 11, display: "flex", alignItems: "center", gap: 5, border: tagColors?.[tag] ? `1px solid ${tagColors[tag]}44` : "none" }}>
+          {tag}
+          <button onClick={() => onChange(tags.filter((x) => x !== tag))} style={{ background: "none", border: "none", color: tagColors?.[tag] || "#64748b", cursor: "pointer", fontSize: 13, padding: 0, lineHeight: 1 }}>×</button>
+        </span>
+      ))}
+      <input value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" || e.key === ",") { e.preventDefault(); add(); }}} onBlur={add} placeholder="add tag…" style={{ background: "transparent", border: "none", color: "var(--text)", fontSize: 12, outline: "none", width: 72 }} />
+    </div>
+  );
+}
+
+function ImageUpload({ label, value, filename, onChangeImage, onChangeFilename }) {
+  const ref = useRef(null);
+  const [uploading, setUploading] = useState(false);
+  const handle = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    const dataUrl = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file); });
+    const { imageId, thumb } = await compressAndStore(dataUrl);
+    onChangeImage({ imageId, thumb });
+    onChangeFilename(file.name);
+    setUploading(false);
+  };
+  const imgSrc = value?.thumb || value?.data || value;
+  const isSet = !!imgSrc && imgSrc !== "null";
+  return (
+    <div>
+      {label && <label style={{ fontSize: 12, color: "var(--muted)", display: "block", marginBottom: 4 }}>{label}</label>}
+      {isSet ? (
+        <div>
+          <div style={{ position: "relative", display: "inline-block" }}>
+            <img src={imgSrc} alt="" style={{ maxHeight: 100, maxWidth: "100%", borderRadius: 4 }} />
+            <button onClick={async () => { if (value?.imageId) await deleteImage(value.imageId); onChangeImage(null); onChangeFilename(""); if (ref.current) ref.current.value = ""; }} style={{ position: "absolute", top: 2, right: 2, background: "rgba(0,0,0,0.7)", border: "none", color: "#ef4444", borderRadius: 3, cursor: "pointer", fontSize: 13, width: 20, height: 20, display: "flex", alignItems: "center", justifyContent: "center", padding: 0 }}>×</button>
+          </div>
+          <input value={filename || ""} onChange={(e) => onChangeFilename(e.target.value)} placeholder="filename" style={{ display: "block", marginTop: 4, background: "var(--input-bg)", border: "1px solid var(--border)", borderRadius: 3, padding: "3px 8px", color: "var(--text)", fontSize: 11, fontFamily: "var(--mono)", outline: "none", width: "100%", boxSizing: "border-box" }} />
+        </div>
+      ) : (
+        <>
+          {uploading && <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 4 }}>Compressing…</div>}
+          <input type="file" accept="image/*" ref={ref} onChange={handle} style={{ fontSize: 12, color: "var(--muted)" }} />
+        </>
+      )}
+    </div>
+  );
+}
+
+function LazyImage({ imageId, thumb, alt, style, onClick }) {
+  const [src, setSrc] = useState(thumb || null);
+  const [loading, setLoading] = useState(false);
+  useEffect(() => {
+    if (!imageId) return;
+    let cancelled = false;
+    setLoading(true);
+    loadImage(imageId).then((data) => {
+      if (!cancelled && data) setSrc(data);
+      setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [imageId]);
+  if (!src) return <div style={{ ...style, background: "var(--input-bg)", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--dimmer)", fontSize: 11 }}>{loading ? "Loading…" : "—"}</div>;
+  return <img src={src} alt={alt || ""} style={style} onClick={onClick} />;
+}
+
+function MultiImageUpload({ images, onChange }) {
+  const ref = useRef(null);
+  const [uploading, setUploading] = useState(false);
+  const addImage = async (e) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    setUploading(true);
+    const newImgs = [];
+    for (const file of files) {
+      const dataUrl = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file); });
+      const { imageId, thumb } = await compressAndStore(dataUrl);
+      newImgs.push({ imageId, thumb, filename: file.name });
+    }
+    onChange([...images, ...newImgs]);
+    setUploading(false);
+    if (ref.current) ref.current.value = "";
+  };
+  const remove = async (idx) => {
+    const img = images[idx];
+    if (img?.imageId) await deleteImage(img.imageId);
+    onChange(images.filter((_, i) => i !== idx));
+  };
+  const updateFilename = (idx, fn) => onChange(images.map((img, i) => i === idx ? { ...img, filename: fn } : img));
+  return (
+    <div>
+      <label style={{ fontSize: 12, color: "var(--muted)", display: "block", marginBottom: 4 }}>Generated images</label>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: images.length ? 8 : 0 }}>
+        {images.map((img, idx) => (
+          <div key={idx} style={{ position: "relative" }}>
+            <img src={img.thumb || img.data} alt="" style={{ height: 72, width: 72, objectFit: "cover", borderRadius: 4 }} />
+            <button onClick={() => remove(idx)} style={{ position: "absolute", top: -4, right: -4, background: "#ef4444", border: "none", color: "#fff", borderRadius: 10, cursor: "pointer", fontSize: 10, width: 16, height: 16, display: "flex", alignItems: "center", justifyContent: "center", padding: 0 }}>×</button>
+            <input value={img.filename || ""} onChange={(e) => updateFilename(idx, e.target.value)} style={{ display: "block", width: 72, marginTop: 2, background: "var(--input-bg)", border: "1px solid var(--border)", borderRadius: 2, padding: "1px 4px", color: "var(--text)", fontSize: 9, fontFamily: "var(--mono)", outline: "none", boxSizing: "border-box" }} />
+          </div>
+        ))}
+      </div>
+      {uploading && <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 4 }}>Compressing…</div>}
+      <input type="file" accept="image/*" multiple ref={ref} onChange={addImage} style={{ fontSize: 12, color: "var(--muted)" }} />
+    </div>
+  );
+}
+
+function ZoomModal({ src, onClose }) {
+  const [scale, setScale] = useState(1);
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  const dragging = useRef(false);
+  const last = useRef({ x: 0, y: 0 });
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.85)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", cursor: "zoom-out" }}>
+      <div style={{ position: "absolute", top: 12, right: 16, display: "flex", gap: 8 }}>
+        <button onClick={(e) => { e.stopPropagation(); setScale((s) => Math.min(s + 0.5, 5)); }} style={{ background: "rgba(255,255,255,0.1)", border: "none", color: "#fff", fontSize: 18, width: 32, height: 32, borderRadius: 4, cursor: "pointer" }}>+</button>
+        <button onClick={(e) => { e.stopPropagation(); setScale((s) => Math.max(s - 0.5, 0.5)); }} style={{ background: "rgba(255,255,255,0.1)", border: "none", color: "#fff", fontSize: 18, width: 32, height: 32, borderRadius: 4, cursor: "pointer" }}>−</button>
+        <button onClick={(e) => { e.stopPropagation(); setScale(1); setPos({ x: 0, y: 0 }); }} style={{ background: "rgba(255,255,255,0.1)", border: "none", color: "#fff", fontSize: 12, height: 32, borderRadius: 4, cursor: "pointer", padding: "0 10px" }}>Reset</button>
+      </div>
+      <img src={src} alt="" onClick={(e) => e.stopPropagation()}
+        onMouseDown={(e) => { e.stopPropagation(); dragging.current = true; last.current = { x: e.clientX, y: e.clientY }; }}
+        onMouseMove={(e) => { if (!dragging.current) return; setPos((p) => ({ x: p.x + e.clientX - last.current.x, y: p.y + e.clientY - last.current.y })); last.current = { x: e.clientX, y: e.clientY }; }}
+        onMouseUp={() => { dragging.current = false; }}
+        onMouseLeave={() => { dragging.current = false; }}
+        style={{ maxWidth: "90vw", maxHeight: "90vh", transform: `scale(${scale}) translate(${pos.x / scale}px, ${pos.y / scale}px)`, cursor: dragging.current ? "grabbing" : "grab", userSelect: "none", transition: dragging.current ? "none" : "transform 0.15s" }}
+      />
+    </div>
+  );
+}
+
+// ── Prompt formatter with highlights ──
+const HL_COLORS = ["#facc15", "#fb923c", "#4ade80", "#38bdf8", "#c084fc", "#f472b6", "#ef4444"];
+
+function PromptView({ text, highlights = [], onUpdateHighlights }) {
+  const containerRef = useRef(null);
+  const [activeColor, setActiveColor] = useState("#facc15");
+  const [boldMode, setBoldMode] = useState(false);
+
+  const addHighlight = () => {
+    if (!onUpdateHighlights || !containerRef.current) return;
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || !containerRef.current.contains(selection.anchorNode)) return;
+    // Walk text nodes to find character offsets
+    const getOffset = (node, offset) => {
+      const walker = document.createTreeWalker(containerRef.current, NodeFilter.SHOW_TEXT, null);
+      let pos = 0;
+      while (walker.nextNode()) {
+        if (walker.currentNode === node) return pos + offset;
+        pos += walker.currentNode.textContent.length;
+      }
+      return pos;
+    };
+    const start = getOffset(selection.anchorNode, selection.anchorOffset);
+    const end = getOffset(selection.focusNode, selection.focusOffset);
+    const [s, e] = start < end ? [start, end] : [end, start];
+    if (s === e) return;
+    const hl = { start: s, end: e, color: activeColor, bold: boldMode };
+    onUpdateHighlights([...highlights, hl]);
+    selection.removeAllRanges();
+  };
+
+  const removeHighlight = (idx) => {
+    if (!onUpdateHighlights) return;
+    onUpdateHighlights(highlights.filter((_, i) => i !== idx));
+  };
+
+  const clearHighlights = () => {
+    if (!onUpdateHighlights) return;
+    onUpdateHighlights([]);
+  };
+
+  // Build styled character array
+  const rendered = useMemo(() => {
+    const chars = Array.from(text).map((ch, i) => ({ ch, bg: null, bold: false, color: null }));
+    (highlights || []).forEach((hl) => {
+      for (let i = hl.start; i < hl.end && i < chars.length; i++) {
+        if (hl.color && hl.color !== "bold") chars[i].bg = hl.color + "44";
+        if (hl.bold) chars[i].bold = true;
+        if (hl.textColor) chars[i].color = hl.textColor;
+      }
+    });
+
+    // Parse into lines, detect block labels and hex codes
+    const lines = text.split("\n");
+    const blockRe = /^\*\*\{\{(.+?)\}\}\*\*$/;
+    const hexRe = /#[0-9A-Fa-f]{6}/g;
+    const elements = [];
+    let globalIdx = 0;
+
+    lines.forEach((line, li) => {
+      const lineStart = globalIdx;
+      const bm = line.trim().match(blockRe);
+      if (bm) {
+        const name = bm[1];
+        const clr = BLOCK_COLORS[name] || "var(--accent)";
+        elements.push(
+          <div key={`b${li}`} style={{ margin: "20px 0 6px", padding: "4px 0", borderBottom: `2px solid ${clr}44`, display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ display: "inline-block", width: 4, height: 16, background: clr, borderRadius: 2 }} />
+            <span style={{ fontSize: 13, fontWeight: 700, color: clr, letterSpacing: "0.02em", textTransform: "uppercase" }}>{name}</span>
+          </div>
+        );
+      } else {
+        // Render line with highlights and hex swatches
+        const segs = [];
+        let pos = 0;
+        // Find hex codes in this line
+        const hexMatches = [];
+        let hm;
+        hexRe.lastIndex = 0;
+        while ((hm = hexRe.exec(line)) !== null) hexMatches.push({ idx: hm.index, hex: hm[0] });
+
+        const pushSpan = (from, to, extra) => {
+          for (let i = from; i < to && i < line.length; i++) {
+            const gi = lineStart + i;
+            const c = gi < chars.length ? chars[gi] : { bg: null, bold: false, color: null };
+            segs.push(<span key={`${li}-${i}`} style={{ background: c.bg || undefined, fontWeight: c.bold ? 700 : undefined, color: c.color || undefined, ...extra }}>{line[i]}</span>);
+          }
+        };
+
+        let cursor = 0;
+        hexMatches.forEach((hm) => {
+          if (hm.idx > cursor) pushSpan(cursor, hm.idx);
+          // Hex swatch
+          segs.push(<span key={`sw${li}-${hm.idx}`} style={{ display: "inline-block", width: 10, height: 10, background: hm.hex, borderRadius: 2, border: "1px solid rgba(255,255,255,0.15)", verticalAlign: "middle", marginRight: 2 }} />);
+          // Hex text with highlight support
+          for (let i = hm.idx; i < hm.idx + hm.hex.length; i++) {
+            const gi = lineStart + i;
+            const c = gi < chars.length ? chars[gi] : { bg: null, bold: false, color: null };
+            segs.push(<span key={`${li}-${i}`} style={{ color: c.color || hm.hex, fontWeight: c.bold ? 700 : 500, background: c.bg || undefined }}>{line[i]}</span>);
+          }
+          cursor = hm.idx + hm.hex.length;
+        });
+        if (cursor < line.length) pushSpan(cursor, line.length);
+
+        elements.push(
+          <div key={`l${li}`} style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", minHeight: line === "" ? "0.85em" : undefined }}>
+            {segs.length ? segs : "\u200B"}
+          </div>
+        );
+      }
+      globalIdx += line.length + 1; // +1 for \n
+    });
+    return elements;
+  }, [text, highlights]);
+
+  return (
+    <div>
+      {/* Toolbar */}
+      {onUpdateHighlights && (
+        <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 12, padding: "6px 0", borderBottom: "1px solid var(--border)" }}>
+          <span style={{ fontSize: 11, color: "var(--dim)", marginRight: 4 }}>Highlight:</span>
+          {HL_COLORS.map((c) => (
+            <button key={c} onClick={() => setActiveColor(c)} style={{ width: 18, height: 18, borderRadius: 3, background: c, border: activeColor === c ? "2px solid var(--text)" : "2px solid transparent", cursor: "pointer", padding: 0 }} />
+          ))}
+          <div style={{ width: 1, height: 16, background: "var(--border)", margin: "0 4px" }} />
+          <button onClick={() => setBoldMode(!boldMode)} style={{ background: boldMode ? "var(--input-bg)" : "none", border: "1px solid var(--border)", borderRadius: 3, padding: "2px 8px", fontSize: 12, fontWeight: 700, color: boldMode ? "var(--text)" : "var(--dim)", cursor: "pointer" }}>B</button>
+          <button onClick={addHighlight} style={{ background: "var(--accent)", border: "none", borderRadius: 3, padding: "2px 10px", fontSize: 11, color: "#fff", cursor: "pointer" }}>Apply</button>
+          {highlights.length > 0 && (
+            <button onClick={clearHighlights} style={{ background: "none", border: "1px solid var(--border)", borderRadius: 3, padding: "2px 8px", fontSize: 11, color: "var(--danger)", cursor: "pointer", marginLeft: "auto" }}>Clear all</button>
+          )}
+        </div>
+      )}
+      {/* Highlight list */}
+      {onUpdateHighlights && highlights.length > 0 && (
+        <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 8 }}>
+          {highlights.map((hl, i) => (
+            <span key={i} style={{ background: (hl.color || "#facc15") + "33", border: `1px solid ${hl.color || "#facc15"}55`, borderRadius: 3, padding: "1px 6px", fontSize: 10, color: "var(--muted)", display: "flex", alignItems: "center", gap: 4 }}>
+              {text.slice(hl.start, Math.min(hl.end, hl.start + 20))}{hl.end - hl.start > 20 ? "…" : ""}
+              {hl.bold && <strong>B</strong>}
+              <button onClick={() => removeHighlight(i)} style={{ background: "none", border: "none", color: "var(--dim)", cursor: "pointer", fontSize: 11, padding: 0, lineHeight: 1 }}>×</button>
+            </span>
+          ))}
+        </div>
+      )}
+      {/* Rendered text */}
+      <div ref={containerRef} style={{ fontFamily: "var(--mono)", fontSize: 12.5, lineHeight: 1.7, color: "var(--muted)", userSelect: "text" }}>
+        {rendered}
+      </div>
+    </div>
+  );
+}
+
+// ── Themes ──
+const themes = {
+  dark: { "--bg": "#0f172a", "--bg2": "#0a0f1a", "--panel": "#0f172a", "--input-bg": "#1e293b", "--border": "#1e293b", "--border2": "#334155", "--text": "#e2e8f0", "--text2": "#f1f5f9", "--muted": "#94a3b8", "--dim": "#64748b", "--dimmer": "#475569", "--accent": "#0ea5e9", "--accent-bg": "#0c2d48", "--danger": "#ef4444", "--mono": "'SF Mono','Fira Code','Cascadia Code',monospace" },
+  light: { "--bg": "#f8fafc", "--bg2": "#f1f5f9", "--panel": "#ffffff", "--input-bg": "#f1f5f9", "--border": "#e2e8f0", "--border2": "#cbd5e1", "--text": "#1e293b", "--text2": "#0f172a", "--muted": "#64748b", "--dim": "#94a3b8", "--dimmer": "#cbd5e1", "--accent": "#0284c7", "--accent-bg": "#e0f2fe", "--danger": "#dc2626", "--mono": "'SF Mono','Fira Code','Cascadia Code',monospace" },
+};
+
+// ── Main ──
+function PromptCatalog() {
+  const [entries, setEntries] = useState([]);
+  const [selId, setSelId] = useState(null);
+  const [filter, setFilter] = useState("");
+  const [search, setSearch] = useState("");
+  const [searchScope, setSearchScope] = useState("all");
+  const [useRegex, setUseRegex] = useState(false);
+  const [ignoreCase, setIgnoreCase] = useState(true);
+  const [regexError, setRegexError] = useState(null);
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState(newEntry());
+  const [tabMap, setTabMap] = useState({});
+  const [editing, setEditing] = useState(false);
+  const [editForm, setEditForm] = useState(null);
+  const [bulkIds, setBulkIds] = useState(new Set());
+  const [bulkAction, setBulkAction] = useState(null);
+  const [bulkValue, setBulkValue] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [sortField, setSortField] = useState("sortOrder");
+  const [sortDir, setSortDir] = useState("desc");
+  const [viewMode, setViewMode] = useState("list"); // "list" | "grid"
+  const [theme, setTheme] = useState("dark");
+  const [tagColors, setTagColors] = useState({});
+  const [templates, setTemplates] = useState([]);
+  const [showTemplates, setShowTemplates] = useState(false);
+  const [showStats, setShowStats] = useState(false);
+  const [diffIds, setDiffIds] = useState(null); // [idA, idB]
+  const [showTrash, setShowTrash] = useState(false);
+  const [zoomImg, setZoomImg] = useState(null);
+  const [dragId, setDragId] = useState(null);
+  const [folders, setFolders] = useState([]); // [{id, name}]
+  const [activeFolder, setActiveFolder] = useState(null); // null = all, "" = unfiled, or folder id
+  const [showFolderMgmt, setShowFolderMgmt] = useState(false);
+  const [newFolderName, setNewFolderName] = useState("");
+  const importRef = useRef(null);
+  const listRef = useRef(null);
+
+  // Load
+  const [storageInfo, setStorageInfo] = useState(null);
+  useEffect(() => {
+    (async () => {
+      let [e, tc, tp, th, fl] = await Promise.all([sGet(STORE.entries), sGet(STORE.tagColors), sGet(STORE.templates), sGet(STORE.theme), sGet(STORE.folders)]);
+      // Migrate from v3 if v4 is empty
+      if (!e) {
+        const v3 = await sGet("pc-entries-v3");
+        if (v3 && v3.length) {
+          const migrated = [];
+          for (const x of v3) {
+            const entry = { ...newEntry(), ...x };
+            if (entry.outputImages) {
+              const migImgs = [];
+              for (const img of entry.outputImages) {
+                if (img.data && !img.imageId) {
+                  const { imageId, thumb } = await compressAndStore(img.data);
+                  migImgs.push({ imageId, thumb, filename: img.filename || "" });
+                } else migImgs.push(img);
+              }
+              entry.outputImages = migImgs;
+            }
+            if (x.refImage && typeof x.refImage === "string" && !x.refImageId) {
+              const { imageId, thumb } = await compressAndStore(x.refImage);
+              entry.refImageId = imageId; entry.refThumb = thumb;
+            }
+            delete entry.outputImage; delete entry.outputFilename; delete entry.refImage;
+            migrated.push(entry);
+          }
+          e = migrated;
+          await sSet(STORE.entries, e);
+        }
+      }
+      if (e) { setEntries(e); if (e.length) setSelId(e.find((x) => !x.deleted)?.id || null); }
+      if (tc) setTagColors(tc);
+      if (tp) setTemplates(tp);
+      if (th) setTheme(th);
+      if (fl) setFolders(fl);
+      // Storage usage estimate
+      try {
+        const keys = { keys: await idbListKeys("pc-") };
+        if (keys.keys) {
+          const imgKeys = keys.keys.filter((k) => k.startsWith("pc-img:"));
+          setStorageInfo({ images: imgKeys.length, entryCount: (e || []).filter((x) => !x.deleted).length });
+        }
+      } catch {}
+      setLoading(false);
+    })();
+  }, []);
+
+  const persist = useCallback(async (d) => { await sSet(STORE.entries, d); }, []);
+  const persistColors = useCallback(async (d) => { setTagColors(d); await sSet(STORE.tagColors, d); }, []);
+  const persistTemplates = useCallback(async (d) => { setTemplates(d); await sSet(STORE.templates, d); }, []);
+  const persistTheme = useCallback(async (t) => { setTheme(t); await sSet(STORE.theme, t); }, []);
+  const persistFolders = useCallback(async (f) => { setFolders(f); await sSet(STORE.folders, f); }, []);
+
+  // ── Entry operations ──
+  const addEntry = async () => {
+    if (!form.prompt.trim()) return;
+    const entry = { ...form, id: uid(), title: form.title.trim() || `Entry ${entries.filter((e) => !e.deleted).length + 1}`, prompt: form.prompt.trim(), model: form.model.trim(), imageDate: (form.imageDate || "").trim(), notes: (form.notes || "").trim(), sortOrder: Date.now(), createdAt: Date.now(), modifiedAt: Date.now() };
+    const upd = [entry, ...entries];
+    setEntries(upd); setSelId(entry.id); setForm(newEntry()); setShowForm(false);
+    setTabMap((m) => ({ ...m, [entry.id]: "output" }));
+    await persist(upd);
+  };
+
+  const delEntry = async (id, hard = false) => {
+    let upd;
+    if (hard) { upd = entries.filter((e) => e.id !== id); }
+    else { upd = entries.map((e) => e.id === id ? { ...e, deleted: true } : e); }
+    setEntries(upd);
+    if (selId === id) setSelId(upd.find((e) => !e.deleted)?.id || null);
+    setEditing(false); setEditForm(null);
+    await persist(upd);
+  };
+
+  const restoreEntry = async (id) => {
+    const upd = entries.map((e) => e.id === id ? { ...e, deleted: false } : e);
+    setEntries(upd); await persist(upd);
+  };
+
+  const emptyTrash = async () => {
+    const upd = entries.filter((e) => !e.deleted);
+    setEntries(upd); await persist(upd);
+  };
+
+  const duplicateEntry = async (id) => {
+    const src = entries.find((e) => e.id === id);
+    if (!src) return;
+    const dup = { ...src, id: uid(), title: src.title + " (copy)", parentId: src.id, createdAt: Date.now(), sortOrder: Date.now(), deleted: false };
+    const upd = [dup, ...entries];
+    setEntries(upd); setSelId(dup.id);
+    setTabMap((m) => ({ ...m, [dup.id]: "output" }));
+    await persist(upd);
+  };
+
+  const startEdit = () => { if (!sel) return; setEditForm({ ...sel }); setEditing(true); };
+  const cancelEdit = () => { setEditing(false); setEditForm(null); };
+  const saveEdit = async () => {
+    if (!editForm || !editForm.prompt.trim()) return;
+    const upd = entries.map((e) => e.id === editForm.id ? { ...editForm, title: editForm.title.trim() || e.title, prompt: editForm.prompt.trim(), model: editForm.model.trim(), imageDate: (editForm.imageDate || "").trim(), notes: (editForm.notes || "").trim(), modifiedAt: Date.now() } : e);
+    setEntries(upd); setEditing(false); setEditForm(null); await persist(upd);
+  };
+
+  // ── Bulk ──
+  const bulkApply = async () => {
+    if (bulkIds.size === 0 || !bulkAction) return;
+    const v = bulkValue.trim();
+    let upd = entries;
+    if (bulkAction === "addTag" && v) { const tag = v.toLowerCase(); upd = entries.map((e) => bulkIds.has(e.id) && !e.tags.includes(tag) ? { ...e, tags: [...e.tags, tag] } : e); }
+    else if (bulkAction === "removeTag" && v) { const tag = v.toLowerCase(); upd = entries.map((e) => bulkIds.has(e.id) ? { ...e, tags: e.tags.filter((t) => t !== tag) } : e); }
+    else if (bulkAction === "setModel") { upd = entries.map((e) => bulkIds.has(e.id) ? { ...e, model: v } : e); }
+    else if (bulkAction === "setDate") { upd = entries.map((e) => bulkIds.has(e.id) ? { ...e, imageDate: v } : e); }
+    else if (bulkAction === "moveFolder") { upd = entries.map((e) => bulkIds.has(e.id) ? { ...e, folder: v } : e); }
+    setEntries(upd); setBulkAction(null); setBulkValue(""); await persist(upd);
+  };
+  const bulkDelete = async () => {
+    if (bulkIds.size === 0) return;
+    const upd = entries.map((e) => bulkIds.has(e.id) ? { ...e, deleted: true } : e);
+    setEntries(upd); if (bulkIds.has(selId)) setSelId(upd.find((e) => !e.deleted)?.id || null);
+    setBulkIds(new Set()); setBulkAction(null); setBulkValue(""); await persist(upd);
+  };
+  const toggleBulk = (id) => { setBulkIds((prev) => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next; }); };
+
+  // ── Folders ──
+  const addFolder = async (name) => {
+    if (!name.trim() || folders.some((f) => f.name === name.trim())) return;
+    await persistFolders([...folders, { id: uid(), name: name.trim() }]);
+  };
+  const renameFolder = async (id, name) => {
+    if (!name.trim()) return;
+    await persistFolders(folders.map((f) => f.id === id ? { ...f, name: name.trim() } : f));
+  };
+  const deleteFolder = async (id) => {
+    await persistFolders(folders.filter((f) => f.id !== id));
+    // Unfile entries in this folder
+    const fld = folders.find((f) => f.id === id);
+    if (fld) { const upd = entries.map((e) => e.folder === fld.name ? { ...e, folder: "" } : e); setEntries(upd); await persist(upd); }
+    if (activeFolder === id) setActiveFolder(null);
+  };
+  const moveToFolder = async (entryId, folderName) => {
+    const upd = entries.map((e) => e.id === entryId ? { ...e, folder: folderName } : e);
+    setEntries(upd); await persist(upd);
+  };
+
+  // ── Import/Export ──
+  const exportJSON = async () => {
+    if (entries.length === 0) return;
+    // Bundle full images inline for export portability
+    const bundled = [];
+    for (const e of entries) {
+      const copy = { ...e };
+      if (copy.outputImages) {
+        copy.outputImages = await Promise.all(copy.outputImages.map(async (img) => {
+          if (img.imageId) { const data = await loadImage(img.imageId); return { data: data || img.thumb, filename: img.filename }; }
+          return img;
+        }));
+      }
+      if (copy.refImageId) { const data = await loadImage(copy.refImageId); copy.refImage = data || copy.refThumb; }
+      bundled.push(copy);
+    }
+    const blob = new Blob([JSON.stringify(bundled, null, 2)], { type: "application/json" }); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `prompt-catalog-${new Date().toISOString().slice(0, 10)}.json`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  };
+  const exportMD = () => {
+    const live = entries.filter((e) => !e.deleted);
+    const md = live.map((e) => `## ${e.title}\n\n**Model:** ${e.model || "—"} | **Date:** ${fmtDate(e.createdAt)}${e.imageDate ? ` | **Image date:** ${e.imageDate}` : ""}\n**Tags:** ${e.tags.join(", ") || "—"}\n\n### Prompt\n\n${e.prompt}\n${e.notes ? `\n### Notes\n\n${e.notes}\n` : ""}\n---\n`).join("\n");
+    const blob = new Blob([md], { type: "text/markdown" }); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `prompt-catalog-${new Date().toISOString().slice(0, 10)}.md`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  };
+  const exportCSV = () => {
+    const live = entries.filter((e) => !e.deleted);
+    const esc = (s) => `"${(s || "").replace(/"/g, '""')}"`;
+    const rows = [["title","model","imageDate","createdAt","tags","prompt","notes","outputFilenames","refFilename"].join(",")];
+    live.forEach((e) => rows.push([esc(e.title), esc(e.model), esc(e.imageDate), esc(fmtDate(e.createdAt)), esc(e.tags.join(";")), esc(e.prompt), esc(e.notes), esc((e.outputImages || []).map((i) => i.filename).join(";")), esc(e.refFilename)].join(",")));
+    const blob = new Blob([rows.join("\n")], { type: "text/csv" }); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `prompt-catalog-${new Date().toISOString().slice(0, 10)}.csv`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  };
+  const importEntries = (e) => {
+    const file = e.target.files?.[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        const imported = JSON.parse(reader.result);
+        if (!Array.isArray(imported)) return;
+        const existingIds = new Set(entries.map((x) => x.id));
+        const fresh = imported.filter((x) => x.id && x.prompt && !existingIds.has(x.id));
+        if (fresh.length === 0) return;
+        // Migrate any inline image data to sharded storage
+        const migrated = [];
+        for (const x of fresh) {
+          const entry = { ...newEntry(), ...x };
+          // v2 single outputImage
+          if (x.outputImage && !x.outputImages) {
+            const { imageId, thumb } = await compressAndStore(x.outputImage);
+            entry.outputImages = [{ imageId, thumb, filename: x.outputFilename || "" }];
+          }
+          // v3 outputImages with inline data
+          if (entry.outputImages) {
+            const migImgs = [];
+            for (const img of entry.outputImages) {
+              if (img.data && !img.imageId) {
+                const { imageId, thumb } = await compressAndStore(img.data);
+                migImgs.push({ imageId, thumb, filename: img.filename || "" });
+              } else { migImgs.push(img); }
+            }
+            entry.outputImages = migImgs;
+          }
+          // v3 refImage inline
+          if (x.refImage && typeof x.refImage === "string" && !x.refImageId) {
+            const { imageId, thumb } = await compressAndStore(x.refImage);
+            entry.refImageId = imageId; entry.refThumb = thumb;
+          }
+          delete entry.outputImage; delete entry.outputFilename; delete entry.refImage;
+          migrated.push(entry);
+        }
+        const upd = [...migrated, ...entries];
+        setEntries(upd); setSelId(upd.find((x) => !x.deleted)?.id || null); await persist(upd);
+      } catch {}
+    };
+    reader.readAsText(file);
+    if (importRef.current) importRef.current.value = "";
+  };
+
+  // ── Templates ──
+  const saveTemplate = async (name, text) => {
+    const upd = [...templates, { id: uid(), name, template: text }];
+    await persistTemplates(upd);
+  };
+  const deleteTemplate = async (id) => { const upd = templates.filter((t) => t.id !== id); await persistTemplates(upd); };
+
+  // ── Tag colors ──
+  const cycleTagColor = async (tag) => {
+    const current = tagColors[tag];
+    const idx = current ? TAG_PALETTE.indexOf(current) : -1;
+    const next = TAG_PALETTE[(idx + 1) % TAG_PALETTE.length];
+    await persistColors({ ...tagColors, [tag]: next });
+  };
+  const clearTagColor = async (tag) => {
+    const upd = { ...tagColors }; delete upd[tag]; await persistColors(upd);
+  };
+
+  // ── Drag reorder ──
+  const onDragOver = (e, id) => { e.preventDefault(); if (dragId && dragId !== id) { e.currentTarget.style.borderTop = "2px solid var(--accent)"; } };
+  const onDragLeave = (e) => { e.currentTarget.style.borderTop = ""; };
+  const onDrop = async (e, targetId) => {
+    e.currentTarget.style.borderTop = "";
+    if (!dragId || dragId === targetId) return;
+    const dragEntry = entries.find((x) => x.id === dragId);
+    const targetEntry = entries.find((x) => x.id === targetId);
+    if (!dragEntry || !targetEntry) return;
+    const upd = entries.map((x) => {
+      if (x.id === dragId) return { ...x, sortOrder: targetEntry.sortOrder - 1 };
+      return x;
+    });
+    setEntries(upd); setDragId(null); await persist(upd);
+  };
+
+  // ── Search ──
+  const searchMatch = useCallback((entry) => {
+    if (!search) return true;
+    const tagStr = (entry.tags || []).join(" ");
+    const outNames = (entry.outputImages || []).map((i) => i.filename || "").join(" ");
+    const fields = {
+      all: [entry.prompt, outNames, entry.refFilename || "", entry.title, entry.model, tagStr, entry.notes || ""],
+      prompt: [entry.prompt],
+      filenames: [outNames, entry.refFilename || ""],
+    }[searchScope];
+    if (useRegex) { try { const re = new RegExp(search, ignoreCase ? "i" : ""); setRegexError(null); return fields.some((f) => re.test(f)); } catch (e) { setRegexError(e.message); return true; } }
+    if (ignoreCase) { const q = search.toLowerCase(); return fields.some((f) => f.toLowerCase().includes(q)); }
+    return fields.some((f) => f.includes(search));
+  }, [search, searchScope, useRegex, ignoreCase]);
+
+  // ── Derived ──
+  const liveEntries = useMemo(() => entries.filter((e) => showTrash ? e.deleted : !e.deleted), [entries, showTrash]);
+  const allTags = useMemo(() => [...new Set(entries.filter((e) => !e.deleted).flatMap((e) => e.tags))].sort(), [entries]);
+  const tagCounts = useMemo(() => { const c = {}; entries.filter((e) => !e.deleted).forEach((e) => e.tags.forEach((t) => { c[t] = (c[t] || 0) + 1; })); return c; }, [entries]);
+
+  const filtered = useMemo(() => {
+    let list = liveEntries.filter((e) => {
+      if (filter && !e.tags.includes(filter)) return false;
+      if (!showTrash && activeFolder !== null) {
+        if (activeFolder === "") { if (e.folder) return false; }
+        else { const fld = folders.find((f) => f.id === activeFolder); if (fld && e.folder !== fld.name) return false; }
+      }
+      return searchMatch(e);
+    });
+    // Pin sort
+    list.sort((a, b) => {
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      const av = a[sortField] || 0, bv = b[sortField] || 0;
+      if (sortField === "title" || sortField === "model") return sortDir === "asc" ? String(av).localeCompare(String(bv)) : String(bv).localeCompare(String(av));
+      return sortDir === "asc" ? av - bv : bv - av;
+    });
+    return list;
+  }, [liveEntries, filter, searchMatch, sortField, sortDir, activeFolder, folders, showTrash]);
+
+  const sel = entries.find((e) => e.id === selId);
+  const trashCount = entries.filter((e) => e.deleted).length;
+
+  // ── Lineage ──
+  const getLineage = (entry) => {
+    const chain = [];
+    let cur = entry;
+    while (cur?.parentId) { const parent = entries.find((e) => e.id === cur.parentId); if (!parent || chain.includes(parent)) break; chain.unshift(parent); cur = parent; }
+    chain.push(entry);
+    const children = entries.filter((e) => e.parentId === entry.id && !e.deleted);
+    return { ancestors: chain.slice(0, -1), children };
+  };
+
+  // ── Stats ──
+  const stats = useMemo(() => {
+    const live = entries.filter((e) => !e.deleted);
+    const byModel = {}; live.forEach((e) => { const m = e.model || "unset"; byModel[m] = (byModel[m] || 0) + 1; });
+    const byMonth = {}; live.forEach((e) => { const m = new Date(e.createdAt).toLocaleDateString("en-US", { year: "numeric", month: "short" }); byMonth[m] = (byMonth[m] || 0) + 1; });
+    return { total: live.length, byModel, byMonth, topTags: allTags.slice(0, 10).map((t) => ({ tag: t, count: tagCounts[t] || 0 })) };
+  }, [entries, allTags, tagCounts]);
+
+  // ── Keyboard nav ──
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const idx = filtered.findIndex((x) => x.id === selId);
+        const next = e.key === "ArrowDown" ? Math.min(idx + 1, filtered.length - 1) : Math.max(idx - 1, 0);
+        if (filtered[next]) { setSelId(filtered[next].id); setEditing(false); setEditForm(null); }
+      }
+      if (e.key === "e" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); if (sel && !editing) startEdit(); }
+      if (e.key === "Escape" && editing) cancelEdit();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  });
+
+  const selectAllFiltered = () => {
+    if (filtered.every((e) => bulkIds.has(e.id))) { setBulkIds((p) => { const n = new Set(p); filtered.forEach((e) => n.delete(e.id)); return n; }); }
+    else { setBulkIds((p) => { const n = new Set(p); filtered.forEach((e) => n.add(e.id)); return n; }); }
+  };
+
+  // ── Toggle pin ──
+  const togglePin = async (id) => {
+    const upd = entries.map((e) => e.id === id ? { ...e, pinned: !e.pinned } : e);
+    setEntries(upd); await persist(upd);
+  };
+
+  // ── Copy prompt ──
+  const copyPrompt = async (text) => { try { await navigator.clipboard.writeText(text); } catch {} };
+
+  // ── Drive sync ──
+  const [sharing, setSharing] = useState(false);
+  const handleShare = async () => {
+    if (entries.length === 0) return;
+    setSharing(true);
+    try {
+      // Bundle full images
+      const bundled = [];
+      for (const e of entries) {
+        const copy = { ...e };
+        if (copy.outputImages) {
+          copy.outputImages = await Promise.all(copy.outputImages.map(async (img) => {
+            if (img.imageId) { const data = await loadImage(img.imageId); return { data: data || img.thumb, filename: img.filename }; }
+            return img;
+          }));
+        }
+        if (copy.refImageId) { const data = await loadImage(copy.refImageId); copy.refImage = data || copy.refThumb; }
+        bundled.push(copy);
+      }
+      const json = JSON.stringify(bundled, null, 2);
+      const blob = new Blob([json], { type: "application/json" });
+      const filename = `prompt-catalog-${new Date().toISOString().slice(0, 10)}.json`;
+      const file = new File([blob], filename, { type: "application/json" });
+
+      // Try native share on mobile
+      if (/iPhone|iPad|Android/i.test(navigator.userAgent) && navigator.share && navigator.canShare?.({ files: [file] })) {
+        try { await navigator.share({ files: [file], title: "Prompt Catalog" }); } catch (err) { if (err.name !== "AbortError") throw err; }
+      } else {
+        // Desktop: just download
+        const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = filename;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(a.href);
+      }
+    } catch (err) { console.error("Share failed:", err); }
+    setSharing(false);
+  };
+
+  const updateHighlights = async (entryId, newHighlights) => {
+    const upd = entries.map((e) => e.id === entryId ? { ...e, highlights: newHighlights } : e);
+    setEntries(upd); await persist(upd);
+  };
+
+  if (loading) return <div style={{ background: "#0f172a", color: "#94a3b8", height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "system-ui" }}>Loading…</div>;
+
+  const t = themes[theme];
+  const inputStyle = { background: "var(--input-bg)", border: "1px solid var(--border2)", borderRadius: 4, padding: "6px 10px", color: "var(--text)", fontSize: 13, outline: "none", width: "100%", boxSizing: "border-box" };
+  const tab = tabMap[selId] || "output";
+  const setTab = (v) => setTabMap((m) => ({ ...m, [selId]: v }));
+
+  return (
+    <div style={{ ...t, display: "flex", height: "100vh", background: "var(--bg)", color: "var(--text)", fontFamily: "system-ui, -apple-system, sans-serif", fontSize: 14 }}>
+      {zoomImg && <ZoomModal src={zoomImg} onClose={() => setZoomImg(null)} />}
+
+      {/* ── Sidebar ── */}
+      <div style={{ width: 280, minWidth: 280, borderRight: "1px solid var(--border)", display: "flex", flexDirection: "column", background: "var(--panel)" }}>
+        <div style={{ padding: "12px 14px 8px", borderBottom: "1px solid var(--border)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+            <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text2)" }}>Prompt Catalog</span>
+            <div style={{ display: "flex", gap: 4 }}>
+              <button onClick={() => persistTheme(theme === "dark" ? "light" : "dark")} title="Toggle theme" style={{ background: "none", border: "1px solid var(--border)", borderRadius: 3, color: "var(--dim)", padding: "3px 6px", fontSize: 12, cursor: "pointer" }}>{theme === "dark" ? "☀" : "☾"}</button>
+              <button onClick={() => setShowStats(!showStats)} title="Stats" style={{ background: showStats ? "var(--input-bg)" : "none", border: "1px solid var(--border)", borderRadius: 3, color: "var(--dim)", padding: "3px 6px", fontSize: 11, cursor: "pointer" }}>Stats</button>
+              <button onClick={() => setShowFolderMgmt(!showFolderMgmt)} title="Manage folders" style={{ background: showFolderMgmt ? "var(--input-bg)" : "none", border: "1px solid var(--border)", borderRadius: 3, color: "var(--dim)", padding: "3px 6px", fontSize: 11, cursor: "pointer" }}>📁</button>
+              <button onClick={() => { if (!showForm) { setSelId(null); setShowForm(true); setEditing(false); setEditForm(null); } else { setShowForm(false); } }} style={{ background: showForm ? "var(--border2)" : "var(--accent)", color: "#fff", border: "none", borderRadius: 4, padding: "3px 10px", fontSize: 13, cursor: "pointer", fontWeight: 500 }}>{showForm ? "Cancel" : "+ New"}</button>
+            </div>
+          </div>
+
+          {/* Sort & View */}
+          <div style={{ display: "flex", gap: 4, marginBottom: 6, alignItems: "center" }}>
+            <select value={sortField} onChange={(e) => setSortField(e.target.value)} style={{ background: "var(--input-bg)", border: "1px solid var(--border)", borderRadius: 3, color: "var(--text)", fontSize: 10, padding: "2px 4px", outline: "none" }}>
+              <option value="sortOrder">Manual</option><option value="createdAt">Created</option><option value="imageDate">Image date</option><option value="title">Title</option><option value="model">Model</option>
+            </select>
+            <button onClick={() => setSortDir((d) => d === "asc" ? "desc" : "asc")} style={{ background: "none", border: "1px solid var(--border)", borderRadius: 3, color: "var(--dim)", padding: "2px 5px", fontSize: 10, cursor: "pointer" }}>{sortDir === "asc" ? "↑" : "↓"}</button>
+            <button onClick={() => setViewMode(viewMode === "list" ? "grid" : "list")} title={viewMode === "list" ? "Grid view" : "List view"} style={{ background: "none", border: "1px solid var(--border)", borderRadius: 3, color: "var(--dim)", padding: "2px 5px", fontSize: 10, cursor: "pointer", marginLeft: "auto" }}>{viewMode === "list" ? "▦" : "☰"}</button>
+            <button onClick={() => { setShowTrash(!showTrash); setBulkIds(new Set()); }} style={{ background: showTrash ? "var(--input-bg)" : "none", border: "1px solid var(--border)", borderRadius: 3, color: showTrash ? "var(--danger)" : "var(--dim)", padding: "2px 5px", fontSize: 10, cursor: "pointer" }}>🗑{trashCount > 0 ? ` ${trashCount}` : ""}</button>
+          </div>
+
+          {/* Folders */}
+          {!showTrash && (folders.length > 0 || showFolderMgmt) && (
+            <div style={{ marginBottom: 6 }}>
+              <div style={{ display: "flex", gap: 3, flexWrap: "wrap", marginBottom: showFolderMgmt ? 4 : 0 }}>
+                <button onClick={() => setActiveFolder(null)} style={{ background: activeFolder === null ? "var(--input-bg)" : "transparent", color: activeFolder === null ? "var(--text)" : "var(--dim)", border: "1px solid var(--border)", borderRadius: 3, padding: "1px 6px", fontSize: 10, cursor: "pointer" }}>All</button>
+                <button onClick={() => setActiveFolder("")} style={{ background: activeFolder === "" ? "var(--input-bg)" : "transparent", color: activeFolder === "" ? "var(--text)" : "var(--dim)", border: "1px solid var(--border)", borderRadius: 3, padding: "1px 6px", fontSize: 10, cursor: "pointer" }}>Unfiled</button>
+                {folders.map((fld) => (
+                  <button key={fld.id} onClick={() => setActiveFolder(activeFolder === fld.id ? null : fld.id)} style={{ background: activeFolder === fld.id ? "var(--input-bg)" : "transparent", color: activeFolder === fld.id ? "var(--text)" : "var(--dim)", border: "1px solid var(--border)", borderRadius: 3, padding: "1px 6px", fontSize: 10, cursor: "pointer" }}>📁 {fld.name}</button>
+                ))}
+                <button onClick={() => setShowFolderMgmt(!showFolderMgmt)} style={{ background: "none", border: "1px solid var(--border)", borderRadius: 3, color: "var(--dim)", padding: "1px 5px", fontSize: 10, cursor: "pointer" }}>⚙</button>
+              </div>
+              {showFolderMgmt && (
+                <div style={{ background: "var(--input-bg)", borderRadius: 4, padding: 8, marginTop: 2 }}>
+                  <div style={{ display: "flex", gap: 4, marginBottom: folders.length ? 6 : 0 }}>
+                    <input value={newFolderName} onChange={(e) => setNewFolderName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { addFolder(newFolderName); setNewFolderName(""); } }} placeholder="New folder…" style={{ flex: 1, background: "var(--bg)", border: "1px solid var(--border2)", borderRadius: 3, padding: "3px 6px", color: "var(--text)", fontSize: 11, outline: "none" }} />
+                    <button onClick={() => { addFolder(newFolderName); setNewFolderName(""); }} style={{ background: "var(--accent)", border: "none", borderRadius: 3, color: "#fff", padding: "3px 8px", fontSize: 10, cursor: "pointer" }}>Add</button>
+                  </div>
+                  {folders.map((fld) => (
+                    <div key={fld.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "2px 0" }}>
+                      <span style={{ fontSize: 11, color: "var(--muted)" }}>📁 {fld.name}</span>
+                      <div style={{ display: "flex", gap: 4 }}>
+                        <button onClick={() => { const n = prompt("Rename folder:", fld.name); if (n) renameFolder(fld.id, n); }} style={{ background: "none", border: "none", color: "var(--dim)", fontSize: 10, cursor: "pointer" }}>Rename</button>
+                        <button onClick={() => { if (confirm(`Delete folder "${fld.name}"? Entries will be unfiled.`)) deleteFolder(fld.id); }} style={{ background: "none", border: "none", color: "var(--danger)", fontSize: 10, cursor: "pointer" }}>×</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Tags */}
+          {allTags.length > 0 && !showTrash && (
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 6 }}>
+              <button onClick={() => setFilter("")} style={{ background: !filter ? "var(--input-bg)" : "transparent", color: !filter ? "var(--text)" : "var(--dim)", border: "1px solid var(--border)", borderRadius: 3, padding: "1px 7px", fontSize: 10, cursor: "pointer" }}>All</button>
+              {allTags.map((tg) => (
+                <button key={tg} onClick={() => setFilter(filter === tg ? "" : tg)} onContextMenu={(e) => { e.preventDefault(); cycleTagColor(tg); }} title="Click to filter, right-click to color" style={{ background: filter === tg ? (tagColors[tg] ? tagColors[tg] + "33" : "var(--input-bg)") : "transparent", color: tagColors[tg] || (filter === tg ? "var(--text)" : "var(--dim)"), border: `1px solid ${tagColors[tg] ? tagColors[tg] + "55" : "var(--border)"}`, borderRadius: 3, padding: "1px 7px", fontSize: 10, cursor: "pointer" }}>{tg} <span style={{ fontSize: 9, opacity: 0.6 }}>{tagCounts[tg]}</span></button>
+              ))}
+            </div>
+          )}
+
+          {/* Search */}
+          <div>
+            <div style={{ position: "relative" }}>
+              <input value={search} onChange={(e) => { setSearch(e.target.value); setRegexError(null); }} placeholder={useRegex ? "regex…" : "search…"} style={{ background: "var(--input-bg)", border: regexError ? "1px solid var(--danger)" : "1px solid var(--border2)", borderRadius: 4, padding: "5px 24px 5px 8px", color: "var(--text)", fontSize: 12, outline: "none", width: "100%", boxSizing: "border-box" }} />
+              {search && <button onClick={() => { setSearch(""); setRegexError(null); }} style={{ position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: "var(--dim)", cursor: "pointer", fontSize: 13, padding: 0 }}>×</button>}
+            </div>
+            {regexError && <div style={{ fontSize: 10, color: "var(--danger)", marginTop: 2 }}>{regexError}</div>}
+            <div style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 4 }}>
+              {[{ key: "all", label: "All" }, { key: "prompt", label: "Prompt" }, { key: "filenames", label: "Files" }].map((s) => (
+                <button key={s.key} onClick={() => setSearchScope(s.key)} style={{ background: searchScope === s.key ? "var(--input-bg)" : "transparent", color: searchScope === s.key ? "var(--text)" : "var(--dim)", border: "1px solid var(--border)", borderRadius: 3, padding: "1px 6px", fontSize: 10, cursor: "pointer" }}>{s.label}</button>
+              ))}
+              <button onClick={() => setUseRegex(!useRegex)} style={{ marginLeft: "auto", background: useRegex ? "var(--input-bg)" : "transparent", color: useRegex ? "var(--accent)" : "var(--dim)", border: "1px solid var(--border)", borderRadius: 3, padding: "1px 6px", fontSize: 10, cursor: "pointer", fontFamily: "var(--mono)" }}>.*</button>
+              <button onClick={() => setIgnoreCase(!ignoreCase)} title={ignoreCase ? "Case insensitive" : "Case sensitive"} style={{ background: !ignoreCase ? "var(--input-bg)" : "transparent", color: !ignoreCase ? "var(--accent)" : "var(--dim)", border: "1px solid var(--border)", borderRadius: 3, padding: "1px 6px", fontSize: 10, cursor: "pointer", fontFamily: "var(--mono)" }}>Aa</button>
+            </div>
+          </div>
+        </div>
+
+        {/* Bulk bar */}
+        {bulkIds.size > 0 && !showTrash && (
+          <div style={{ padding: "8px 14px", borderBottom: "1px solid var(--border)", background: "var(--input-bg)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <span style={{ fontSize: 12, color: "var(--text)", fontWeight: 500 }}>{bulkIds.size} selected</span>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button onClick={() => setDiffIds(bulkIds.size === 2 ? [...bulkIds] : null)} disabled={bulkIds.size !== 2} style={{ background: "none", border: "none", color: bulkIds.size === 2 ? "var(--accent)" : "var(--dimmer)", fontSize: 11, cursor: bulkIds.size === 2 ? "pointer" : "default", padding: 0 }}>Diff</button>
+                <button onClick={() => { setBulkIds(new Set()); setBulkAction(null); setBulkValue(""); }} style={{ background: "none", border: "none", color: "var(--dim)", cursor: "pointer", fontSize: 12, padding: 0 }}>Clear</button>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: bulkAction ? 6 : 0 }}>
+              {[{ key: "addTag", label: "+ Tag" }, { key: "removeTag", label: "− Tag" }, { key: "setModel", label: "Model" }, { key: "setDate", label: "Date" }, { key: "moveFolder", label: "Folder" }].map((a) => (
+                <button key={a.key} onClick={() => { setBulkAction(bulkAction === a.key ? null : a.key); setBulkValue(""); }} style={{ background: bulkAction === a.key ? "var(--border2)" : "transparent", color: bulkAction === a.key ? "var(--text)" : "var(--muted)", border: "1px solid var(--border2)", borderRadius: 3, padding: "2px 7px", fontSize: 11, cursor: "pointer" }}>{a.label}</button>
+              ))}
+              <button onClick={() => { if (confirm(`Delete ${bulkIds.size} entries?`)) bulkDelete(); }} style={{ background: "transparent", border: "1px solid var(--border2)", borderRadius: 3, padding: "2px 7px", fontSize: 11, cursor: "pointer", color: "var(--danger)", marginLeft: "auto" }}>Delete</button>
+            </div>
+            {bulkAction && (
+              <div style={{ display: "flex", gap: 4 }}>
+                <input value={bulkValue} onChange={(e) => setBulkValue(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") bulkApply(); }} placeholder={bulkAction === "addTag" ? "tag" : bulkAction === "removeTag" ? "tag" : bulkAction === "setModel" ? "model" : bulkAction === "moveFolder" ? "folder name" : "date"} style={{ flex: 1, background: "var(--bg)", border: "1px solid var(--border2)", borderRadius: 3, padding: "3px 8px", color: "var(--text)", fontSize: 11, outline: "none" }} />
+                <button onClick={bulkApply} style={{ background: "var(--accent)", border: "none", borderRadius: 3, color: "#fff", padding: "3px 10px", fontSize: 11, cursor: "pointer" }}>Apply</button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Stats panel */}
+        {showStats && (
+          <div style={{ padding: 14, borderBottom: "1px solid var(--border)", background: "var(--input-bg)", overflowY: "auto", maxHeight: "30vh" }}>
+            <div style={{ fontSize: 12, color: "var(--text)", fontWeight: 600, marginBottom: 6 }}>Statistics</div>
+            <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 4 }}>Total entries: {stats.total}</div>
+            <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 2, fontWeight: 500 }}>By model:</div>
+            {Object.entries(stats.byModel).sort((a, b) => b[1] - a[1]).map(([m, c]) => (
+              <div key={m} style={{ fontSize: 11, color: "var(--dim)", paddingLeft: 8 }}>{m}: {c}</div>
+            ))}
+            <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 6, marginBottom: 2, fontWeight: 500 }}>By month:</div>
+            {Object.entries(stats.byMonth).map(([m, c]) => (
+              <div key={m} style={{ fontSize: 11, color: "var(--dim)", paddingLeft: 8 }}>{m}: {c}</div>
+            ))}
+            {stats.topTags.length > 0 && <>
+              <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 6, marginBottom: 2, fontWeight: 500 }}>Top tags:</div>
+              {stats.topTags.map(({ tag, count }) => (
+                <div key={tag} style={{ fontSize: 11, color: "var(--dim)", paddingLeft: 8 }}>{tag}: {count}</div>
+              ))}
+            </>}
+          </div>
+        )}
+
+        {/* Entry list */}
+        <div ref={listRef} style={{ flex: 1, overflowY: "auto" }}>
+          {filtered.length === 0 ? (
+            <div style={{ padding: 24, textAlign: "center", color: "var(--dimmer)", fontSize: 13 }}>{entries.filter((e) => !e.deleted).length === 0 ? "No entries yet." : showTrash ? "Trash is empty." : "No matches."}</div>
+          ) : viewMode === "grid" ? (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(100px, 1fr))", gap: 4, padding: 8 }}>
+              {filtered.map((entry) => (
+                <div key={entry.id} onClick={() => { setSelId(entry.id); setEditing(false); setEditForm(null); setShowForm(false); }} style={{ cursor: "pointer", borderRadius: 4, border: selId === entry.id ? "2px solid var(--accent)" : "2px solid transparent", overflow: "hidden", position: "relative" }}>
+                  {entry.pinned && <span style={{ position: "absolute", top: 2, left: 2, fontSize: 10 }}>📌</span>}
+                  {(entry.outputImages || [])[0]?.thumb ? (
+                    <img src={entry.outputImages[0].thumb} alt="" style={{ width: "100%", aspectRatio: "1", objectFit: "cover" }} />
+                  ) : (
+                    <div style={{ width: "100%", aspectRatio: "1", background: "var(--input-bg)", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--dimmer)", fontSize: 10 }}>—</div>
+                  )}
+                  <div style={{ padding: "3px 4px", fontSize: 9, color: "var(--dim)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{entry.title}</div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <>
+              {filtered.length > 1 && !showTrash && (
+                <div style={{ padding: "4px 14px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 6 }}>
+                  <input type="checkbox" checked={filtered.every((e) => bulkIds.has(e.id))} onChange={selectAllFiltered} style={{ accentColor: "var(--accent)", cursor: "pointer" }} />
+                  <span style={{ fontSize: 11, color: "var(--dim)" }}>Select all ({filtered.length})</span>
+                </div>
+              )}
+              {filtered.map((entry) => (
+                <div key={entry.id} draggable={sortField === "sortOrder" && !showTrash} onDragStart={() => setDragId(entry.id)} onDragOver={(e) => onDragOver(e, entry.id)} onDragLeave={onDragLeave} onDrop={(e) => onDrop(e, entry.id)} style={{ display: "flex", gap: 8, padding: "8px 14px", cursor: "pointer", background: selId === entry.id ? "var(--input-bg)" : "transparent", borderBottom: "1px solid var(--border)", alignItems: "center" }}>
+                  {!showTrash && <input type="checkbox" checked={bulkIds.has(entry.id)} onChange={() => toggleBulk(entry.id)} onClick={(e) => e.stopPropagation()} style={{ accentColor: "var(--accent)", cursor: "pointer", flexShrink: 0 }} />}
+                  <div onClick={() => { setSelId(entry.id); setEditing(false); setEditForm(null); setShowForm(false); }} style={{ display: "flex", gap: 8, flex: 1, alignItems: "center", minWidth: 0 }}>
+                    {(entry.outputImages || [])[0]?.thumb ? (
+                      <img src={entry.outputImages[0].thumb} alt="" style={{ width: 40, height: 40, objectFit: "cover", borderRadius: 4, flexShrink: 0 }} />
+                    ) : (
+                      <div style={{ width: 40, height: 40, background: "var(--border2)", borderRadius: 4, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--dimmer)", fontSize: 10 }}>—</div>
+                    )}
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 12, fontWeight: 500, color: "var(--text2)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{entry.pinned ? "📌 " : ""}{entry.title}</div>
+                      <div style={{ fontSize: 10, color: "var(--dim)", marginTop: 1 }}>
+                        {entry.model && <span style={{ color: "var(--muted)" }}>{entry.model}</span>}
+                        {entry.model && " · "}{fmtDate(entry.createdAt)}
+                        {entry.refImageId && " · ref"}
+                        {(entry.outputImages || []).length > 1 && ` · ${entry.outputImages.length} imgs`}
+                      </div>
+                      {entry.tags.length > 0 && <div style={{ fontSize: 9, color: "var(--dimmer)", marginTop: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{entry.tags.map((tg) => <span key={tg} style={{ color: tagColors[tg] || "var(--dimmer)", marginRight: 6 }}>{tg}</span>)}</div>}
+                    </div>
+                  </div>
+                  {showTrash && (
+                    <div style={{ display: "flex", gap: 4 }}>
+                      <button onClick={(e) => { e.stopPropagation(); restoreEntry(entry.id); }} style={{ background: "none", border: "1px solid var(--border)", borderRadius: 3, color: "var(--accent)", padding: "2px 6px", fontSize: 10, cursor: "pointer" }}>Restore</button>
+                      <button onClick={(e) => { e.stopPropagation(); if (confirm("Permanently delete?")) delEntry(entry.id, true); }} style={{ background: "none", border: "1px solid var(--border)", borderRadius: 3, color: "var(--danger)", padding: "2px 6px", fontSize: 10, cursor: "pointer" }}>Perm</button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div style={{ padding: "6px 14px", borderTop: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 4 }}>
+          <span style={{ fontSize: 10, color: "var(--dimmer)" }}>{filtered.length} shown · {entries.filter((e) => !e.deleted).length} total{storageInfo ? ` · ${storageInfo.images} imgs` : ""}</span>
+          <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+            <button onClick={handleShare} disabled={entries.length === 0 || sharing} title="Share catalog via AirDrop, Files, etc." style={{ background: "none", border: "1px solid var(--accent)", borderRadius: 3, color: "var(--accent)", padding: "2px 8px", fontSize: 10, cursor: entries.length && !sharing ? "pointer" : "default", fontWeight: 500, opacity: sharing ? 0.6 : 1 }}>{sharing ? "Preparing…" : "Share"}</button>
+            <input type="file" accept=".json" ref={importRef} onChange={importEntries} style={{ display: "none" }} />
+            <button onClick={() => importRef.current?.click()} style={{ background: "none", border: "1px solid var(--border)", borderRadius: 3, color: "var(--dim)", padding: "2px 6px", fontSize: 10, cursor: "pointer" }}>Import</button>
+            <select onChange={(e) => { if (e.target.value === "json") exportJSON(); else if (e.target.value === "md") exportMD(); else if (e.target.value === "csv") exportCSV(); e.target.value = ""; }} defaultValue="" style={{ background: "none", border: "1px solid var(--border)", borderRadius: 3, color: "var(--dim)", padding: "2px 4px", fontSize: 10, cursor: "pointer", outline: "none" }}>
+              <option value="" disabled>Export</option><option value="json">JSON</option><option value="md">Markdown</option><option value="csv">CSV</option>
+            </select>
+            {showTrash && trashCount > 0 && <button onClick={() => { if (confirm("Empty trash? This is permanent.")) emptyTrash(); }} style={{ background: "none", border: "1px solid var(--border)", borderRadius: 3, color: "var(--danger)", padding: "2px 6px", fontSize: 10, cursor: "pointer" }}>Empty trash</button>}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Main panel ── */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+        {diffIds ? (() => {
+          const a = entries.find((e) => e.id === diffIds[0]);
+          const b = entries.find((e) => e.id === diffIds[1]);
+          if (!a || !b) return null;
+          const diff = wordDiff(a.prompt, b.prompt);
+          return (
+            <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
+              <div style={{ padding: "10px 24px", borderBottom: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text2)" }}>Diff: {a.title} ↔ {b.title}</span>
+                <button onClick={() => setDiffIds(null)} style={{ background: "none", border: "1px solid var(--border2)", borderRadius: 4, color: "var(--muted)", padding: "3px 10px", fontSize: 12, cursor: "pointer" }}>Close</button>
+              </div>
+              <div style={{ flex: 1, overflow: "auto", padding: 24 }}>
+                <pre style={{ fontFamily: "var(--mono)", fontSize: 12.5, lineHeight: 1.8, whiteSpace: "pre-wrap", wordBreak: "break-word", margin: 0 }}>
+                  {diff.map((d, i) => (
+                    <span key={i} style={{ background: d.type === "add" ? "#22c55e33" : d.type === "del" ? "#ef444433" : "transparent", color: d.type === "add" ? "#22c55e" : d.type === "del" ? "#ef4444" : "var(--muted)", textDecoration: d.type === "del" ? "line-through" : "none" }}>{d.text}</span>
+                  ))}
+                </pre>
+              </div>
+            </div>
+          );
+        })() : sel ? (
+          <>
+            {/* Header */}
+            <div style={{ padding: "10px 24px", borderBottom: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ display: "flex", alignItems: "baseline", gap: 8, flex: 1, minWidth: 0 }}>
+                {editing ? (
+                  <input value={editForm.title} onChange={(e) => setEditForm((f) => ({ ...f, title: e.target.value }))} style={{ background: "var(--input-bg)", border: "1px solid var(--border2)", borderRadius: 4, padding: "4px 8px", color: "var(--text2)", fontSize: 15, fontWeight: 600, outline: "none", width: 200 }} />
+                ) : (
+                  <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text2)" }}>{sel.pinned ? "📌 " : ""}{sel.title}</span>
+                )}
+                {editing ? (
+                  <input value={editForm.model} onChange={(e) => setEditForm((f) => ({ ...f, model: e.target.value }))} placeholder="Model" style={{ background: "var(--input-bg)", border: "1px solid var(--border2)", borderRadius: 4, padding: "4px 8px", color: "var(--accent)", fontSize: 12, outline: "none", width: 110 }} />
+                ) : (
+                  sel.model && <span style={{ fontSize: 12, color: "var(--accent)", background: "var(--accent-bg)", padding: "1px 8px", borderRadius: 3 }}>{sel.model}</span>
+                )}
+                {!editing && <span style={{ fontSize: 11, color: "var(--dim)" }}>{fmtDate(sel.createdAt)}{sel.imageDate ? ` · img ${sel.imageDate}` : ""}{sel.folder ? ` · 📁 ${sel.folder}` : ""}</span>}
+              </div>
+              <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                {editing ? (
+                  <>
+                    <input value={editForm.imageDate || ""} onChange={(e) => setEditForm((f) => ({ ...f, imageDate: e.target.value }))} placeholder="Image date" style={{ background: "var(--input-bg)", border: "1px solid var(--border2)", borderRadius: 4, padding: "4px 8px", color: "var(--muted)", fontSize: 11, outline: "none", width: 85 }} />
+                    {folders.length > 0 && <select value={editForm.folder || ""} onChange={(e) => setEditForm((f) => ({ ...f, folder: e.target.value }))} style={{ background: "var(--input-bg)", border: "1px solid var(--border2)", borderRadius: 4, padding: "4px 6px", color: "var(--muted)", fontSize: 11, outline: "none" }}><option value="">No folder</option>{folders.map((fld) => <option key={fld.id} value={fld.name}>{fld.name}</option>)}</select>}
+                    <button onClick={cancelEdit} style={{ background: "none", border: "1px solid var(--border2)", borderRadius: 4, color: "var(--muted)", padding: "3px 10px", fontSize: 12, cursor: "pointer" }}>Cancel</button>
+                    <button onClick={saveEdit} style={{ background: "var(--accent)", border: "none", borderRadius: 4, color: "#fff", padding: "3px 12px", fontSize: 12, cursor: "pointer", fontWeight: 500 }}>Save</button>
+                  </>
+                ) : (
+                  <>
+                    <button onClick={() => togglePin(sel.id)} title={sel.pinned ? "Unpin" : "Pin"} style={{ background: "none", border: "1px solid var(--border2)", borderRadius: 4, color: "var(--dim)", padding: "3px 8px", fontSize: 11, cursor: "pointer" }}>{sel.pinned ? "Unpin" : "Pin"}</button>
+                    <button onClick={() => duplicateEntry(sel.id)} title="Duplicate" style={{ background: "none", border: "1px solid var(--border2)", borderRadius: 4, color: "var(--dim)", padding: "3px 8px", fontSize: 11, cursor: "pointer" }}>Dup</button>
+                    <button onClick={() => { const name = prompt("Template name:"); if (name) saveTemplate(name, sel.prompt); }} title="Save as template" style={{ background: "none", border: "1px solid var(--border2)", borderRadius: 4, color: "var(--dim)", padding: "3px 8px", fontSize: 11, cursor: "pointer" }}>Tmpl</button>
+                    <button onClick={startEdit} style={{ background: "none", border: "1px solid var(--border2)", borderRadius: 4, color: "var(--muted)", padding: "3px 10px", fontSize: 12, cursor: "pointer" }}>Edit</button>
+                    <button onClick={() => delEntry(sel.id)} style={{ background: "none", border: "1px solid var(--border2)", borderRadius: 4, color: "var(--danger)", padding: "3px 10px", fontSize: 12, cursor: "pointer" }}>Delete</button>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {/* Tags + lineage */}
+            <div style={{ padding: "6px 24px", borderBottom: "1px solid var(--border)", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", minHeight: 28 }}>
+              {editing ? (
+                <TagInput tags={editForm.tags} onChange={(t) => setEditForm((f) => ({ ...f, tags: t }))} tagColors={tagColors} />
+              ) : (
+                <>
+                  {sel.tags.length > 0 && sel.tags.map((tg) => (
+                    <span key={tg} style={{ background: tagColors[tg] ? tagColors[tg] + "22" : "var(--input-bg)", color: tagColors[tg] || "var(--muted)", padding: "1px 9px", borderRadius: 3, fontSize: 11, border: tagColors[tg] ? `1px solid ${tagColors[tg]}44` : "none" }}>{tg}</span>
+                  ))}
+                  {(() => { const lin = getLineage(sel); return (<>
+                    {lin.ancestors.length > 0 && <span style={{ fontSize: 10, color: "var(--dim)" }}>← {lin.ancestors.map((a) => <button key={a.id} onClick={() => setSelId(a.id)} style={{ background: "none", border: "none", color: "var(--accent)", fontSize: 10, cursor: "pointer", padding: 0, textDecoration: "underline" }}>{a.title}</button>)}</span>}
+                    {lin.children.length > 0 && <span style={{ fontSize: 10, color: "var(--dim)" }}>→ {lin.children.map((c) => <button key={c.id} onClick={() => setSelId(c.id)} style={{ background: "none", border: "none", color: "var(--accent)", fontSize: 10, cursor: "pointer", padding: 0, textDecoration: "underline" }}>{c.title}</button>)}</span>}
+                  </>); })()}
+                </>
+              )}
+            </div>
+
+            {/* Tabs */}
+            <div style={{ display: "flex", borderBottom: "1px solid var(--border)", padding: "0 24px" }}>
+              {[{ key: "output", label: `Generated${(sel.outputImages || []).length > 1 ? ` (${sel.outputImages.length})` : ""}` }, { key: "ref", label: "Reference" }, { key: "prompt", label: "Prompt" }, { key: "notes", label: "Notes" }].map((t) => {
+                const active = tab === t.key;
+                return <button key={t.key} onClick={() => setTab(t.key)} style={{ background: "none", border: "none", borderBottom: active ? "2px solid var(--accent)" : "2px solid transparent", color: active ? "var(--text2)" : "var(--dim)", padding: "10px 14px", fontSize: 13, cursor: "pointer", fontWeight: active ? 600 : 400, marginBottom: -1 }}>{t.label}</button>;
+              })}
+            </div>
+
+            {/* Content */}
+            <div style={{ flex: 1, overflow: "auto" }}>
+              {tab === "output" && (
+                <div style={{ padding: 24, background: "var(--bg2)", minHeight: "100%" }}>
+                  {editing ? (
+                    <MultiImageUpload images={editForm.outputImages || []} onChange={(imgs) => setEditForm((f) => ({ ...f, outputImages: imgs }))} />
+                  ) : (sel.outputImages || []).length > 0 ? (
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16 }}>
+                      {sel.outputImages.map((img, idx) => (
+                        <div key={idx} style={{ textAlign: "center" }}>
+                          <LazyImage imageId={img.imageId} thumb={img.thumb} style={{ maxWidth: "100%", maxHeight: "60vh", objectFit: "contain", borderRadius: 6, cursor: "zoom-in" }} onClick={async () => { const full = await loadImage(img.imageId); if (full) setZoomImg(full); }} />
+                          {img.filename && <div style={{ marginTop: 4, fontSize: 11, color: "var(--dim)", fontFamily: "var(--mono)" }}>{img.filename}</div>}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div style={{ textAlign: "center", color: "var(--dimmer)", paddingTop: 48 }}>No images attached</div>
+                  )}
+                </div>
+              )}
+              {tab === "ref" && (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "100%", padding: 24, background: "var(--bg2)" }}>
+                  {editing ? (
+                    <ImageUpload label="" value={editForm.refImageId ? { imageId: editForm.refImageId, thumb: editForm.refThumb } : null} filename={editForm.refFilename || ""} onChangeImage={(v) => setEditForm((f) => ({ ...f, refImageId: v?.imageId || null, refThumb: v?.thumb || null }))} onChangeFilename={(v) => setEditForm((f) => ({ ...f, refFilename: v }))} />
+                  ) : sel.refImageId ? (
+                    <>
+                      <LazyImage imageId={sel.refImageId} thumb={sel.refThumb} style={{ maxWidth: "100%", maxHeight: "70vh", objectFit: "contain", borderRadius: 6, cursor: "zoom-in" }} onClick={async () => { const full = await loadImage(sel.refImageId); if (full) setZoomImg(full); }} />
+                      {sel.refFilename && <span style={{ marginTop: 8, fontSize: 11, color: "var(--dim)", fontFamily: "var(--mono)" }}>{sel.refFilename}</span>}
+                    </>
+                  ) : (
+                    <span style={{ color: "var(--dimmer)" }}>No reference image</span>
+                  )}
+                </div>
+              )}
+              {tab === "prompt" && (
+                <div style={{ padding: 24 }}>
+                  <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 8 }}>
+                    {!editing && <button onClick={() => copyPrompt(sel.prompt)} style={{ background: "none", border: "1px solid var(--border2)", borderRadius: 4, color: "var(--dim)", padding: "3px 10px", fontSize: 11, cursor: "pointer" }}>Copy</button>}
+                  </div>
+                  {editing ? (
+                    <textarea value={editForm.prompt} onChange={(e) => setEditForm((f) => ({ ...f, prompt: e.target.value }))} style={{ width: "100%", minHeight: 300, background: "var(--input-bg)", border: "1px solid var(--border2)", borderRadius: 4, padding: 12, color: "var(--muted)", fontFamily: "var(--mono)", fontSize: 12.5, lineHeight: 1.7, outline: "none", resize: "vertical", boxSizing: "border-box" }} />
+                  ) : (
+                    <PromptView text={sel.prompt} highlights={sel.highlights || []} onUpdateHighlights={(hl) => updateHighlights(sel.id, hl)} />
+                  )}
+                </div>
+              )}
+              {tab === "notes" && (
+                <div style={{ padding: 24 }}>
+                  {editing ? (
+                    <textarea value={editForm.notes || ""} onChange={(e) => setEditForm((f) => ({ ...f, notes: e.target.value }))} placeholder="Add notes — observations, what worked, what didn't…" style={{ width: "100%", minHeight: 200, background: "var(--input-bg)", border: "1px solid var(--border2)", borderRadius: 4, padding: 12, color: "var(--text)", fontSize: 13, lineHeight: 1.6, outline: "none", resize: "vertical", boxSizing: "border-box" }} />
+                  ) : sel.notes ? (
+                    <div style={{ fontSize: 13, lineHeight: 1.6, color: "var(--muted)", whiteSpace: "pre-wrap" }}>{sel.notes}</div>
+                  ) : (
+                    <div style={{ color: "var(--dimmer)", fontSize: 13 }}>No notes. Click Edit to add.</div>
+                  )}
+                </div>
+              )}
+            </div>
+          </>
+        ) : showForm ? (
+          <div style={{ flex: 1, overflow: "auto", padding: "24px 32px" }}>
+            <div style={{ maxWidth: 700 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+                <span style={{ fontSize: 17, fontWeight: 600, color: "var(--text2)" }}>New Entry</span>
+                <button onClick={() => setShowForm(false)} style={{ background: "none", border: "1px solid var(--border2)", borderRadius: 4, color: "var(--muted)", padding: "4px 14px", fontSize: 13, cursor: "pointer" }}>Cancel</button>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                <div>
+                  <label style={{ fontSize: 12, color: "var(--muted)", display: "block", marginBottom: 4 }}>Title (optional)</label>
+                  <input value={form.title} onChange={(e) => setForm((f) => ({ ...f, title: e.target.value }))} style={inputStyle} />
+                </div>
+                <div style={{ display: "flex", gap: 12 }}>
+                  <div style={{ flex: 1 }}>
+                    <label style={{ fontSize: 12, color: "var(--muted)", display: "block", marginBottom: 4 }}>Model</label>
+                    <input value={form.model} onChange={(e) => setForm((f) => ({ ...f, model: e.target.value }))} placeholder="e.g. Grok, Flux" style={inputStyle} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <label style={{ fontSize: 12, color: "var(--muted)", display: "block", marginBottom: 4 }}>Image date</label>
+                    <input value={form.imageDate || ""} onChange={(e) => setForm((f) => ({ ...f, imageDate: e.target.value }))} placeholder="e.g. 2026-08-12" style={inputStyle} />
+                  </div>
+                  {folders.length > 0 && (
+                    <div style={{ flex: 1 }}>
+                      <label style={{ fontSize: 12, color: "var(--muted)", display: "block", marginBottom: 4 }}>Folder</label>
+                      <select value={form.folder || ""} onChange={(e) => setForm((f) => ({ ...f, folder: e.target.value }))} style={inputStyle}>
+                        <option value="">No folder</option>
+                        {folders.map((fld) => <option key={fld.id} value={fld.name}>{fld.name}</option>)}
+                      </select>
+                    </div>
+                  )}
+                </div>
+                <div>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                    <label style={{ fontSize: 12, color: "var(--muted)" }}>Prompt</label>
+                    {templates.length > 0 && <button onClick={() => setShowTemplates(!showTemplates)} style={{ background: "none", border: "none", color: "var(--accent)", fontSize: 11, cursor: "pointer", padding: 0 }}>Load template</button>}
+                  </div>
+                  {showTemplates && templates.length > 0 && (
+                    <div style={{ background: "var(--input-bg)", borderRadius: 4, padding: 8, marginBottom: 8 }}>
+                      {templates.map((tp) => (
+                        <div key={tp.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "4px 0" }}>
+                          <button onClick={() => { setForm((f) => ({ ...f, prompt: tp.template })); setShowTemplates(false); }} style={{ background: "none", border: "none", color: "var(--accent)", fontSize: 12, cursor: "pointer", padding: 0 }}>{tp.name}</button>
+                          <button onClick={() => deleteTemplate(tp.id)} style={{ background: "none", border: "none", color: "var(--danger)", fontSize: 11, cursor: "pointer" }}>×</button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <textarea value={form.prompt} onChange={(e) => setForm((f) => ({ ...f, prompt: e.target.value }))} placeholder="Paste prompt text…" rows={10} style={{ ...inputStyle, fontFamily: "var(--mono)", fontSize: 12, resize: "vertical" }} />
+                </div>
+                <div>
+                  <label style={{ fontSize: 12, color: "var(--muted)", display: "block", marginBottom: 4 }}>Notes (optional)</label>
+                  <textarea value={form.notes || ""} onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))} placeholder="Observations, what worked, what didn't…" rows={3} style={{ ...inputStyle, fontSize: 12, resize: "vertical" }} />
+                </div>
+                <div style={{ display: "flex", gap: 20 }}>
+                  <div style={{ flex: 1 }}>
+                    <MultiImageUpload images={form.outputImages || []} onChange={(imgs) => setForm((f) => ({ ...f, outputImages: imgs }))} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <ImageUpload label="Reference image (optional)" value={form.refImageId ? { imageId: form.refImageId, thumb: form.refThumb } : null} filename={form.refFilename} onChangeImage={(v) => setForm((f) => ({ ...f, refImageId: v?.imageId || null, refThumb: v?.thumb || null }))} onChangeFilename={(v) => setForm((f) => ({ ...f, refFilename: v }))} />
+                  </div>
+                </div>
+                <div>
+                  <label style={{ fontSize: 12, color: "var(--muted)", display: "block", marginBottom: 4 }}>Tags</label>
+                  <TagInput tags={form.tags} onChange={(t) => setForm((f) => ({ ...f, tags: t }))} tagColors={tagColors} />
+                </div>
+                <button onClick={addEntry} disabled={!form.prompt.trim()} style={{ background: form.prompt.trim() ? "var(--accent)" : "var(--input-bg)", color: form.prompt.trim() ? "#fff" : "var(--dimmer)", border: "none", borderRadius: 4, padding: "10px 0", fontSize: 14, fontWeight: 500, cursor: form.prompt.trim() ? "pointer" : "default", marginTop: 8 }}>Save Entry</button>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "var(--dimmer)", gap: 8 }}>
+            <span style={{ fontSize: 15 }}>Select an entry or create a new one</span>
+            <span style={{ fontSize: 11 }}>↑↓ navigate · ⌘E edit · Esc cancel</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Mount
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(PromptCatalog));
+</script>
+</body>
+</html>
