@@ -78,7 +78,8 @@ async function idbListKeys(prefix) {
 const { useState, useEffect, useRef, useCallback, useMemo } = React;
 
 
-const STORE = { entries: "pc-entries-v4", tagColors: "pc-tag-colors", templates: "pc-templates", theme: "pc-theme", folders: "pc-folders" };
+const STORE = { entries: "pc-entries-v4", tagColors: "pc-tag-colors", templates: "pc-templates", theme: "pc-theme", folders: "pc-folders", syncLog: "pc-sync-log" };
+const DEVICE_NAME = /iPhone|iPad/.test(navigator.userAgent) ? "iOS" : /Android/.test(navigator.userAgent) ? "Android" : /Mac/.test(navigator.userAgent) ? "Mac" : /Win/.test(navigator.userAgent) ? "Windows" : "Desktop";
 const TAG_PALETTE = ["#ef4444","#f97316","#eab308","#22c55e","#06b6d4","#3b82f6","#8b5cf6","#ec4899","#f43f5e","#14b8a6","#a855f7","#64748b"];
 const BLOCK_COLORS = { Subject: "#f97316", Clothing: "#eab308", Action: "#22c55e", Context: "#06b6d4", Style: "#8b5cf6", Camera: "#3b82f6", Composition: "#ec4899", Text: "#64748b", Anchor: "#14b8a6" };
 const MAX_PX = 1600;
@@ -475,6 +476,7 @@ function PromptCatalog() {
   const [showTrash, setShowTrash] = useState(false);
   const [zoomImg, setZoomImg] = useState(null);
   const [dragId, setDragId] = useState(null);
+  const [syncLog, setSyncLog] = useState(null); // { lastExport: {device, time}, lastImport: {device, time} }
   const [folders, setFolders] = useState([]); // [{id, name}]
   const [activeFolder, setActiveFolder] = useState(null); // null = all, "" = unfiled, or folder id
   const [showFolderMgmt, setShowFolderMgmt] = useState(false);
@@ -486,7 +488,7 @@ function PromptCatalog() {
   const [storageInfo, setStorageInfo] = useState(null);
   useEffect(() => {
     (async () => {
-      let [e, tc, tp, th, fl] = await Promise.all([sGet(STORE.entries), sGet(STORE.tagColors), sGet(STORE.templates), sGet(STORE.theme), sGet(STORE.folders)]);
+      let [e, tc, tp, th, fl, sl] = await Promise.all([sGet(STORE.entries), sGet(STORE.tagColors), sGet(STORE.templates), sGet(STORE.theme), sGet(STORE.folders), sGet(STORE.syncLog)]);
       // Migrate from v3 if v4 is empty
       if (!e) {
         const v3 = await sGet("pc-entries-v3");
@@ -520,6 +522,7 @@ function PromptCatalog() {
       if (tp) setTemplates(tp);
       if (th) setTheme(th);
       if (fl) setFolders(fl);
+      if (sl) setSyncLog(sl);
       // Storage usage estimate
       try {
         const keys = { keys: await idbListKeys("pc-") };
@@ -537,6 +540,12 @@ function PromptCatalog() {
   const persistTemplates = useCallback(async (d) => { setTemplates(d); await sSet(STORE.templates, d); }, []);
   const persistTheme = useCallback(async (t) => { setTheme(t); await sSet(STORE.theme, t); }, []);
   const persistFolders = useCallback(async (f) => { setFolders(f); await sSet(STORE.folders, f); }, []);
+  const logSync = useCallback(async (action) => {
+    const log = syncLog || {};
+    const stamp = { device: DEVICE_NAME, time: Date.now() };
+    const updated = { ...log, [action]: stamp };
+    setSyncLog(updated); await sSet(STORE.syncLog, updated);
+  }, [syncLog]);
 
   // ── Entry operations ──
   const addEntry = async () => {
@@ -697,6 +706,7 @@ function PromptCatalog() {
         }
         const upd = [...migrated, ...entries];
         setEntries(upd); setSelId(upd.find((x) => !x.deleted)?.id || null); await persist(upd);
+        await logSync("lastImport");
       } catch {}
     };
     reader.readAsText(file);
@@ -861,6 +871,7 @@ function PromptCatalog() {
         document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(a.href);
       }
     } catch (err) { console.error("Share failed:", err); }
+    await logSync("lastExport");
     setSharing(false);
   };
 
@@ -1068,7 +1079,16 @@ function PromptCatalog() {
 
         {/* Footer */}
         <div style={{ padding: "6px 14px", borderTop: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 4 }}>
-          <span style={{ fontSize: 10, color: "var(--dimmer)" }}>{filtered.length} shown · {entries.filter((e) => !e.deleted).length} total{storageInfo ? ` · ${storageInfo.images} imgs` : ""}</span>
+          <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+            <span style={{ fontSize: 10, color: "var(--dimmer)" }}>{filtered.length} shown · {entries.filter((e) => !e.deleted).length} total{storageInfo ? ` · ${storageInfo.images} imgs` : ""}</span>
+            {syncLog && (syncLog.lastExport || syncLog.lastImport) && (
+              <span style={{ fontSize: 9, color: "var(--dimmer)" }}>
+                {syncLog.lastExport && `↑ ${syncLog.lastExport.device} ${fmtDate(syncLog.lastExport.time)}`}
+                {syncLog.lastExport && syncLog.lastImport && " · "}
+                {syncLog.lastImport && `↓ ${syncLog.lastImport.device} ${fmtDate(syncLog.lastImport.time)}`}
+              </span>
+            )}
+          </div>
           <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
             <button onClick={handleShare} disabled={entries.length === 0 || sharing} title="Share catalog via AirDrop, Files, etc." style={{ background: "none", border: "1px solid var(--accent)", borderRadius: 3, color: "var(--accent)", padding: "2px 8px", fontSize: 10, cursor: entries.length && !sharing ? "pointer" : "default", fontWeight: 500, opacity: sharing ? 0.6 : 1 }}>{sharing ? "Preparing…" : "Share"}</button>
             <input type="file" accept=".json" ref={importRef} onChange={importEntries} style={{ display: "none" }} />
