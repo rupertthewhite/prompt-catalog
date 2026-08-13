@@ -83,7 +83,7 @@ const DEVICE_NAME = /iPhone|iPad/.test(navigator.userAgent) ? "iOS" : /Android/.
 const TAG_PALETTE = ["#ef4444","#f97316","#eab308","#22c55e","#06b6d4","#3b82f6","#8b5cf6","#ec4899","#f43f5e","#14b8a6","#a855f7","#64748b"];
 const BLOCK_COLORS = { Subject: "#f97316", Clothing: "#eab308", Action: "#22c55e", Context: "#06b6d4", Style: "#8b5cf6", Camera: "#3b82f6", Composition: "#ec4899", Text: "#64748b", Anchor: "#14b8a6" };
 const MAX_PX = 1600;
-const THUMB_PX = 80;
+const THUMB_PX = 150;
 
 function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 function fmtDate(ts) { return new Date(ts).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }); }
