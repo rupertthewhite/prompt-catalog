@@ -144,7 +144,7 @@ function wordDiff(a, b) {
 }
 
 function newEntry(overrides = {}) {
-  return { id: uid(), title: "", prompt: "", tags: [], model: "", outputImages: [], refImageId: null, refThumb: null, refFilename: "", imageDate: "", notes: "", pinned: false, parentId: null, deleted: false, sortOrder: Date.now(), createdAt: Date.now(), modifiedAt: Date.now(), folder: "", highlights: [], ...overrides };
+  return { id: uid(), title: "", prompt: "", tags: [], model: "", outputImages: [], refImages: [], imageDate: "", notes: "", pinned: false, parentId: null, deleted: false, sortOrder: Date.now(), createdAt: Date.now(), modifiedAt: Date.now(), folder: "", highlights: [], ...overrides };
 }
 // outputImages entries: { imageId, thumb, filename }
 
@@ -223,7 +223,7 @@ function LazyImage({ imageId, thumb, alt, style, onClick }) {
   return <img src={src} alt={alt || ""} style={style} onClick={onClick} />;
 }
 
-function MultiImageUpload({ images, onChange }) {
+function MultiImageUpload({ images, onChange, label }) {
   const ref = useRef(null);
   const [uploading, setUploading] = useState(false);
   const addImage = async (e) => {
@@ -248,7 +248,7 @@ function MultiImageUpload({ images, onChange }) {
   const updateFilename = (idx, fn) => onChange(images.map((img, i) => i === idx ? { ...img, filename: fn } : img));
   return (
     <div>
-      <label style={{ fontSize: 12, color: "var(--muted)", display: "block", marginBottom: 4 }}>Generated images</label>
+      <label style={{ fontSize: 12, color: "var(--muted)", display: "block", marginBottom: 4 }}>{label || "Generated images"}</label>
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: images.length ? 8 : 0 }}>
         {images.map((img, idx) => (
           <div key={idx} style={{ position: "relative" }}>
@@ -508,11 +508,13 @@ function PromptCatalog() {
               }
               entry.outputImages = migImgs;
             }
-            if (x.refImage && typeof x.refImage === "string" && !x.refImageId) {
+            if (x.refImage && typeof x.refImage === "string") {
               const { imageId, thumb } = await compressAndStore(x.refImage);
-              entry.refImageId = imageId; entry.refThumb = thumb;
+              entry.refImages = [{ imageId, thumb, filename: x.refFilename || "" }];
+            } else if (x.refImageId) {
+              entry.refImages = [{ imageId: x.refImageId, thumb: x.refThumb, filename: x.refFilename || "" }];
             }
-            delete entry.outputImage; delete entry.outputFilename; delete entry.refImage;
+            delete entry.outputImage; delete entry.outputFilename; delete entry.refImage; delete entry.refImageId; delete entry.refThumb; delete entry.refFilename;
             migrated.push(entry);
           }
           e = migrated;
@@ -651,7 +653,7 @@ function PromptCatalog() {
           return img;
         }));
       }
-      if (copy.refImageId) { const data = await loadImage(copy.refImageId); copy.refImage = data || copy.refThumb; }
+      copy.refImages = await Promise.all((copy.refImages || []).map(async (img) => { if (img.imageId) { const data = await loadImage(img.imageId); return { data: data || img.thumb, filename: img.filename }; } return img; }));
       bundled.push(copy);
     }
     const blob = new Blob([JSON.stringify(bundled, null, 2)], { type: "application/json" }); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `prompt-catalog-${(() => { const d = new Date(); const pad = n => String(n).padStart(2,'0'); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`; })()}.json`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
@@ -664,8 +666,8 @@ function PromptCatalog() {
   const exportCSV = () => {
     const live = entries.filter((e) => !e.deleted);
     const esc = (s) => `"${(s || "").replace(/"/g, '""')}"`;
-    const rows = [["title","model","imageDate","createdAt","tags","prompt","notes","outputFilenames","refFilename"].join(",")];
-    live.forEach((e) => rows.push([esc(e.title), esc(e.model), esc(e.imageDate), esc(fmtDate(e.createdAt)), esc(e.tags.join(";")), esc(e.prompt), esc(e.notes), esc((e.outputImages || []).map((i) => i.filename).join(";")), esc(e.refFilename)].join(",")));
+    const rows = [["title","model","imageDate","createdAt","tags","prompt","notes","outputFilenames","refFilenames"].join(",")];
+    live.forEach((e) => rows.push([esc(e.title), esc(e.model), esc(e.imageDate), esc(fmtDate(e.createdAt)), esc(e.tags.join(";")), esc(e.prompt), esc(e.notes), esc((e.outputImages || []).map((i) => i.filename).join(";")), esc((e.refImages || []).map((i) => i.filename).join(";"))].join(",")));
     const blob = new Blob([rows.join("\n")], { type: "text/csv" }); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `prompt-catalog-${(() => { const d = new Date(); const pad = n => String(n).padStart(2,'0'); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`; })()}.csv`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
   };
   const [importStatus, setImportStatus] = useState(null);
@@ -722,11 +724,23 @@ function PromptCatalog() {
             }
             entry.outputImages = migImgs;
           }
-          if (x.refImage && typeof x.refImage === "string" && !x.refImageId) {
+          if (x.refImage && typeof x.refImage === "string") {
             const { imageId, thumb } = await compressAndStore(x.refImage);
-            entry.refImageId = imageId; entry.refThumb = thumb;
+            entry.refImages = [{ imageId, thumb, filename: x.refFilename || "" }];
+          } else if (x.refImageId) {
+            entry.refImages = [{ imageId: x.refImageId, thumb: x.refThumb, filename: x.refFilename || "" }];
           }
-          delete entry.outputImage; delete entry.outputFilename; delete entry.refImage;
+          if (entry.refImages) {
+            const migRefs = [];
+            for (const img of entry.refImages) {
+              if (img.data && !img.imageId) {
+                const { imageId, thumb } = await compressAndStore(img.data);
+                migRefs.push({ imageId, thumb, filename: img.filename || "" });
+              } else { migRefs.push(img); }
+            }
+            entry.refImages = migRefs;
+          }
+          delete entry.outputImage; delete entry.outputFilename; delete entry.refImage; delete entry.refImageId; delete entry.refThumb; delete entry.refFilename;
           return entry;
         };
         
@@ -746,8 +760,10 @@ function PromptCatalog() {
                 const lImg = (e.outputImages || [])[i];
                 return { ...rImg, imageId: rImg.imageId || lImg?.imageId, thumb: rImg.thumb || lImg?.thumb };
               }),
-              refImageId: rep.refImageId || e.refImageId,
-              refThumb: rep.refThumb || e.refThumb,
+              refImages: (rep.refImages || []).map((rImg, i) => {
+                const lImg = (e.refImages || [])[i];
+                return { ...rImg, imageId: rImg.imageId || lImg?.imageId, thumb: rImg.thumb || lImg?.thumb };
+              }),
             };
           }
           return e;
@@ -835,9 +851,9 @@ function PromptCatalog() {
     const tagStr = (entry.tags || []).join(" ");
     const outNames = (entry.outputImages || []).map((i) => i.filename || "").join(" ");
     const fields = {
-      all: [entry.prompt, outNames, entry.refFilename || "", entry.title, entry.model, tagStr, entry.notes || ""],
+      all: [entry.prompt, outNames, (entry.refImages || []).map((i) => i.filename || "").join(" "), entry.title, entry.model, tagStr, entry.notes || ""],
       prompt: [entry.prompt],
-      filenames: [outNames, entry.refFilename || ""],
+      filenames: [outNames, (entry.refImages || []).map((i) => i.filename || "").join(" ")],
     }[searchScope];
     if (useRegex) { try { const re = new RegExp(search, ignoreCase ? "i" : ""); setRegexError(null); return fields.some((f) => re.test(f)); } catch (e) { setRegexError(e.message); return true; } }
     if (ignoreCase) { const q = search.toLowerCase(); return fields.some((f) => f.toLowerCase().includes(q)); }
@@ -936,7 +952,7 @@ function PromptCatalog() {
             return img;
           }));
         }
-        if (copy.refImageId) { const data = await loadImage(copy.refImageId); copy.refImage = data || copy.refThumb; }
+        copy.refImages = await Promise.all((copy.refImages || []).map(async (img) => { if (img.imageId) { const data = await loadImage(img.imageId); return { data: data || img.thumb, filename: img.filename }; } return img; }));
         bundled.push(copy);
       }
       const json = JSON.stringify(bundled, null, 2);
@@ -1141,7 +1157,7 @@ function PromptCatalog() {
                       <div style={{ fontSize: 10, color: "var(--dim)", marginTop: 1 }}>
                         {entry.model && <span style={{ color: "var(--muted)" }}>{entry.model}</span>}
                         {entry.model && " · "}{fmtDate(entry.createdAt)}
-                        {entry.refImageId && " · ref"}
+                        {(entry.refImages || []).length > 0 && " · ref"}
                         {(entry.outputImages || []).length > 1 && ` · ${entry.outputImages.length} imgs`}
                       </div>
                       {entry.tags.length > 0 && <div style={{ fontSize: 9, color: "var(--dimmer)", marginTop: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{entry.tags.map((tg) => <span key={tg} style={{ color: tagColors[tg] || "var(--dimmer)", marginRight: 6 }}>{tg}</span>)}</div>}
@@ -1273,7 +1289,7 @@ function PromptCatalog() {
 
             {/* Tabs */}
             <div style={{ display: "flex", borderBottom: "1px solid var(--border)", padding: "0 24px" }}>
-              {[{ key: "output", label: `Generated${(sel.outputImages || []).length > 1 ? ` (${sel.outputImages.length})` : ""}` }, { key: "ref", label: "Reference" }, { key: "prompt", label: "Prompt" }, { key: "notes", label: "Notes" }].map((t) => {
+              {[{ key: "output", label: `Generated${(sel.outputImages || []).length > 1 ? ` (${sel.outputImages.length})` : ""}` }, { key: "ref", label: `Reference${(sel.refImages || []).length > 1 ? ` (${sel.refImages.length})` : ""}` }, { key: "prompt", label: "Prompt" }, { key: "notes", label: "Notes" }].map((t) => {
                 const active = tab === t.key;
                 return <button key={t.key} onClick={() => setTab(t.key)} style={{ background: "none", border: "none", borderBottom: active ? "2px solid var(--accent)" : "2px solid transparent", color: active ? "var(--text2)" : "var(--dim)", padding: "10px 14px", fontSize: 13, cursor: "pointer", fontWeight: active ? 600 : 400, marginBottom: -1 }}>{t.label}</button>;
               })}
@@ -1300,16 +1316,20 @@ function PromptCatalog() {
                 </div>
               )}
               {tab === "ref" && (
-                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "100%", padding: 24, background: "var(--bg2)" }}>
+                <div style={{ padding: 24, background: "var(--bg2)", minHeight: "100%" }}>
                   {editing ? (
-                    <ImageUpload label="" value={editForm.refImageId ? { imageId: editForm.refImageId, thumb: editForm.refThumb } : null} filename={editForm.refFilename || ""} onChangeImage={(v) => setEditForm((f) => ({ ...f, refImageId: v?.imageId || null, refThumb: v?.thumb || null }))} onChangeFilename={(v) => setEditForm((f) => ({ ...f, refFilename: v }))} />
-                  ) : sel.refImageId ? (
-                    <>
-                      <LazyImage imageId={sel.refImageId} thumb={sel.refThumb} style={{ maxWidth: "100%", maxHeight: "70vh", objectFit: "contain", borderRadius: 6, cursor: "zoom-in" }} onClick={async () => { const full = await loadImage(sel.refImageId); if (full) setZoomImg(full); }} />
-                      {sel.refFilename && <span style={{ marginTop: 8, fontSize: 11, color: "var(--dim)", fontFamily: "var(--mono)" }}>{sel.refFilename}</span>}
-                    </>
+                    <MultiImageUpload label="Reference images" images={editForm.refImages || []} onChange={(imgs) => setEditForm((f) => ({ ...f, refImages: imgs }))} />
+                  ) : (sel.refImages || []).length > 0 ? (
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16 }}>
+                      {sel.refImages.map((img, idx) => (
+                        <div key={idx} style={{ textAlign: "center" }}>
+                          <LazyImage imageId={img.imageId} thumb={img.thumb} style={{ maxWidth: "100%", maxHeight: "60vh", objectFit: "contain", borderRadius: 6, cursor: "zoom-in" }} onClick={async () => { const full = await loadImage(img.imageId); if (full) setZoomImg(full); }} />
+                          {img.filename && <div style={{ marginTop: 4, fontSize: 11, color: "var(--dim)", fontFamily: "var(--mono)" }}>{img.filename}</div>}
+                        </div>
+                      ))}
+                    </div>
                   ) : (
-                    <span style={{ color: "var(--dimmer)" }}>No reference image</span>
+                    <div style={{ textAlign: "center", color: "var(--dimmer)", paddingTop: 48 }}>No reference images</div>
                   )}
                 </div>
               )}
@@ -1395,7 +1415,7 @@ function PromptCatalog() {
                     <MultiImageUpload images={form.outputImages || []} onChange={(imgs) => setForm((f) => ({ ...f, outputImages: imgs }))} />
                   </div>
                   <div style={{ flex: 1 }}>
-                    <ImageUpload label="Reference image (optional)" value={form.refImageId ? { imageId: form.refImageId, thumb: form.refThumb } : null} filename={form.refFilename} onChangeImage={(v) => setForm((f) => ({ ...f, refImageId: v?.imageId || null, refThumb: v?.thumb || null }))} onChangeFilename={(v) => setForm((f) => ({ ...f, refFilename: v }))} />
+                    <MultiImageUpload label="Reference images (optional)" images={form.refImages || []} onChange={(imgs) => setForm((f) => ({ ...f, refImages: imgs }))} />
                   </div>
                 </div>
                 <div>
