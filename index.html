@@ -652,19 +652,19 @@ function PromptCatalog() {
       if (copy.refImageId) { const data = await loadImage(copy.refImageId); copy.refImage = data || copy.refThumb; }
       bundled.push(copy);
     }
-    const blob = new Blob([JSON.stringify(bundled, null, 2)], { type: "application/json" }); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `prompt-catalog-${new Date().toISOString().slice(0, 19).replace(/T/, '_').replace(/:/g, '-')}.json`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    const blob = new Blob([JSON.stringify(bundled, null, 2)], { type: "application/json" }); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `prompt-catalog-${(() => { const d = new Date(); const pad = n => String(n).padStart(2,'0'); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`; })()}.json`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
   };
   const exportMD = () => {
     const live = entries.filter((e) => !e.deleted);
     const md = live.map((e) => `## ${e.title}\n\n**Model:** ${e.model || "—"} | **Date:** ${fmtDate(e.createdAt)}${e.imageDate ? ` | **Image date:** ${e.imageDate}` : ""}\n**Tags:** ${e.tags.join(", ") || "—"}\n\n### Prompt\n\n${e.prompt}\n${e.notes ? `\n### Notes\n\n${e.notes}\n` : ""}\n---\n`).join("\n");
-    const blob = new Blob([md], { type: "text/markdown" }); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `prompt-catalog-${new Date().toISOString().slice(0, 19).replace(/T/, '_').replace(/:/g, '-')}.md`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    const blob = new Blob([md], { type: "text/markdown" }); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `prompt-catalog-${(() => { const d = new Date(); const pad = n => String(n).padStart(2,'0'); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`; })()}.md`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
   };
   const exportCSV = () => {
     const live = entries.filter((e) => !e.deleted);
     const esc = (s) => `"${(s || "").replace(/"/g, '""')}"`;
     const rows = [["title","model","imageDate","createdAt","tags","prompt","notes","outputFilenames","refFilename"].join(",")];
     live.forEach((e) => rows.push([esc(e.title), esc(e.model), esc(e.imageDate), esc(fmtDate(e.createdAt)), esc(e.tags.join(";")), esc(e.prompt), esc(e.notes), esc((e.outputImages || []).map((i) => i.filename).join(";")), esc(e.refFilename)].join(",")));
-    const blob = new Blob([rows.join("\n")], { type: "text/csv" }); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `prompt-catalog-${new Date().toISOString().slice(0, 19).replace(/T/, '_').replace(/:/g, '-')}.csv`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    const blob = new Blob([rows.join("\n")], { type: "text/csv" }); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `prompt-catalog-${(() => { const d = new Date(); const pad = n => String(n).padStart(2,'0'); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`; })()}.csv`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
   };
   const [importStatus, setImportStatus] = useState(null);
   const importEntries = (e) => {
@@ -914,7 +914,7 @@ function PromptCatalog() {
       }
       const json = JSON.stringify(bundled, null, 2);
       const blob = new Blob([json], { type: "application/json" });
-      const filename = `prompt-catalog-${new Date().toISOString().slice(0, 19).replace(/T/, '_').replace(/:/g, '-')}.json`;
+      const filename = `prompt-catalog-${(() => { const d = new Date(); const pad = n => String(n).padStart(2,'0'); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`; })()}.json`;
       const file = new File([blob], filename, { type: "application/json" });
 
       // Try native share on mobile
