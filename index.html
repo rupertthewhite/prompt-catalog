@@ -468,6 +468,7 @@ function PromptCatalog() {
   const [sortDir, setSortDir] = useState("desc");
   const [viewMode, setViewMode] = useState("list"); // "list" | "grid"
   const [sidebarWidth, setSidebarWidth] = useState(280);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const resizing = useRef(false);
   const [theme, setTheme] = useState("dark");
   const [tagColors, setTagColors] = useState({});
@@ -990,6 +991,8 @@ function PromptCatalog() {
       {zoomImg && <ZoomModal src={zoomImg} onClose={() => setZoomImg(null)} />}
 
       {/* ── Sidebar ── */}
+      {!sidebarCollapsed && (
+      <>
       <div style={{ width: sidebarWidth, minWidth: 200, maxWidth: 500, borderRight: "1px solid var(--border)", display: "flex", flexDirection: "column", background: "var(--panel)" }}>
         <div style={{ padding: "12px 14px 8px", borderBottom: "1px solid var(--border)" }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
@@ -1210,9 +1213,13 @@ function PromptCatalog() {
       <div onMouseDown={onResizeStart} onTouchStart={onResizeStart} style={{ width: 5, cursor: "col-resize", background: "transparent", flexShrink: 0, position: "relative", zIndex: 10 }}>
         <div style={{ position: "absolute", inset: "0 -2px", background: resizing.current ? "var(--accent)" : "transparent" }} />
       </div>
+      </>
+      )}
 
       {/* ── Main panel ── */}
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, position: "relative" }}>
+        {/* Sidebar toggle */}
+        <button onClick={() => setSidebarCollapsed(!sidebarCollapsed)} style={{ position: "absolute", top: 8, left: 8, zIndex: 20, background: "var(--input-bg)", border: "1px solid var(--border)", borderRadius: 4, color: "var(--dim)", padding: "4px 8px", fontSize: 12, cursor: "pointer" }} title={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}>{sidebarCollapsed ? "☰" : "◀"}</button>
         {diffIds ? (() => {
           const a = entries.find((e) => e.id === diffIds[0]);
           const b = entries.find((e) => e.id === diffIds[1]);
